@@ -34,7 +34,21 @@ VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 
 ## Agent Modes
 
-`AGENT_DRIVER=mock` is the default for local development. It exercises Supabase, tRPC, local sessions, SSE, and MotionDoc updates without calling an LLM.
+`AGENT_DRIVER=mock` is the default for local development. It exercises tRPC, local sessions, SSE, and MotionDoc updates without calling an LLM.
+
+### Testing without Supabase (dev auth bypass)
+
+If you don't have Supabase set up, enable `DEV_AUTH_BYPASS=1` (dev only — it is ignored when `NODE_ENV=production`). Every request then authenticates as `DEV_USER_ID` (default `dev-user`), so you can drive the tRPC procedures, the web UI, and `/api/agent/stream` with no token. Example — the full agent stream over HTTP:
+
+```bash
+DEV_AUTH_BYPASS=1 AGENT_DRIVER=mock npm run dev
+# in another shell (use the server port printed by `npm run dev`):
+curl -sN -X POST http://localhost:3000/api/agent/stream \
+  -H 'content-type: application/json' \
+  -d '{"message":"Create a deck about stateless agents","motionDoc":"","llmApiKey":"dummy-key-123456"}'
+```
+
+With `AGENT_DRIVER=heddle` the same call runs the real agent (needs a valid `llmApiKey` in the body and `MOTIONDOC_MCP_*` configured).
 
 The Heddle SDK is installed as `@roackb2/heddle` (>= 4.1.0). Set `AGENT_DRIVER=heddle` and point at the SlideX MotionDoc MCP command:
 
