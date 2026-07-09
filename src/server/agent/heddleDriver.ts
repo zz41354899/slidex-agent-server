@@ -38,15 +38,30 @@ export function createHeddleDriver(env: Env): AgentDriver {
       );
       await fs.mkdir(stateRoot, { recursive: true });
 
+      // Dev-only: resolve credentials from a Heddle OAuth store (e.g. a Codex
+      // subscription) instead of the per-request API key. Production always
+      // uses the user's own key.
+      const devAuthStore =
+        env.NODE_ENV !== "production" && env.DEV_HEDDLE_AUTH_STORE
+          ? path.resolve(env.DEV_HEDDLE_AUTH_STORE)
+          : undefined;
+
       const engine = createConversationEngine({
         workspaceRoot: env.HEDDLE_WORKSPACE_ROOT || process.cwd(),
         stateRoot,
-        apiKey: args.llmApiKey,
-        preferApiKey: true,
+        ...(devAuthStore
+          ? { credentialStorePath: devAuthStore }
+          : { apiKey: args.llmApiKey, preferApiKey: true }),
         model: args.model,
         memoryMaintenanceMode: "none",
         hostExtensions: [extension.extension]
       }) as unknown as ConversationEngineLike;
+
+      if (devAuthStore) {
+        console.warn(
+          `[agent] DEV_HEDDLE_AUTH_STORE is ON — using Heddle OAuth credentials from ${devAuthStore} instead of the request llmApiKey.`
+        );
+      }
 
       return runSlideXAgent({
         engine,

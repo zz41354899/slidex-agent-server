@@ -17,8 +17,10 @@ import type { AgentProgressEvent } from "../src/server/agent/types.js";
 async function main(): Promise<void> {
   const env = loadEnv();
   const apiKey = process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY;
-  if (!apiKey) {
-    throw new Error("Set OPENAI_API_KEY (or LLM_API_KEY) to run the agent harness.");
+  if (!apiKey && !env.DEV_HEDDLE_AUTH_STORE) {
+    throw new Error(
+      "Set OPENAI_API_KEY (or LLM_API_KEY), or DEV_HEDDLE_AUTH_STORE for Heddle OAuth credentials (e.g. a Codex subscription)."
+    );
   }
   if (!env.MOTIONDOC_MCP_COMMAND) {
     throw new Error("Set MOTIONDOC_MCP_COMMAND/ARGS/CWD to the SlideX MotionDoc MCP.");
@@ -54,7 +56,7 @@ async function main(): Promise<void> {
     motionDoc: "",
     message,
     history: [],
-    llmApiKey: apiKey,
+    llmApiKey: apiKey ?? "dev-oauth-placeholder",
     model: env.DEFAULT_MODEL,
     signal: new AbortController().signal,
     emit,
