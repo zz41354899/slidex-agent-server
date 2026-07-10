@@ -56,7 +56,6 @@ export function createAgentStreamHandler(deps: AgentStreamDeps) {
         sessionId: session.id,
         motionDoc: input.motionDoc,
         message: input.message,
-        history: session.messages,
         llmApiKey: input.llmApiKey,
         model: input.model || deps.env.DEFAULT_MODEL,
         signal: abortController.signal,

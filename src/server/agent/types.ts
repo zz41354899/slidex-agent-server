@@ -1,6 +1,5 @@
 import type { AuthUser } from "../auth.js";
 import type { StdioMcpProcessManager } from "../mcp/stdioMcp.js";
-import type { ChatMessage } from "../../shared/schema.js";
 
 export type AgentEmit = (event: AgentProgressEvent) => void | Promise<void>;
 
@@ -20,7 +19,6 @@ export type AgentRunArgs = {
   sessionId: string;
   motionDoc: string;
   message: string;
-  history: ChatMessage[];
   llmApiKey: string;
   model: string;
   signal: AbortSignal;

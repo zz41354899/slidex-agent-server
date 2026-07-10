@@ -1,12 +1,15 @@
 /**
  * Dev harness: run the SlideX Heddle agent end-to-end WITHOUT the HTTP/Supabase
- * stack. Exercises the real engine + SlideX MCP + LLM + MotionDoc extraction.
+ * stack. Exercises the real engine + SlideX MCP + LLM + mirror capture and can
+ * submit multiple turns through one durable Heddle session.
  *
  * Requires: OPENAI_API_KEY (or the key for DEFAULT_MODEL's provider),
  * MOTIONDOC_MCP_COMMAND/ARGS/CWD pointing at the SlideX MotionDoc MCP.
  *
  * Usage:
  *   OPENAI_API_KEY=... npx tsx scripts/trySlidexAgent.ts "Create a 5-slide pitch deck for SlideX."
+ *   OPENAI_API_KEY=... npx tsx scripts/trySlidexAgent.ts \
+ *     "Create a 3-slide pitch deck." --then "Make slide 2 more visual."
  */
 import "dotenv/config";
 import { createHeddleDriver } from "../src/server/agent/heddleDriver.js";
@@ -26,7 +29,7 @@ async function main(): Promise<void> {
     throw new Error("Set MOTIONDOC_MCP_COMMAND/ARGS/CWD to the SlideX MotionDoc MCP.");
   }
 
-  const message = process.argv.slice(2).join(" ").trim() || "Create a 5-slide pitch deck for SlideX.";
+  const messages = readMessages(process.argv.slice(2));
   const driver = createHeddleDriver(env);
 
   const emit = (event: AgentProgressEvent): void => {
@@ -48,27 +51,44 @@ async function main(): Promise<void> {
 
   console.log(`Model: ${env.DEFAULT_MODEL}`);
   console.log(`MCP: ${env.MOTIONDOC_MCP_COMMAND} ${env.MOTIONDOC_MCP_ARGS ?? ""}`);
-  console.log(`Message: ${message}\n`);
+  const mcpManager = new StdioMcpProcessManager(env);
+  let motionDoc = "";
 
-  const result = await driver.run({
-    user: { id: "dev-harness-user" },
-    sessionId: "dev-harness-session",
-    motionDoc: "",
-    message,
-    history: [],
-    llmApiKey: apiKey ?? "dev-oauth-placeholder",
-    model: env.DEFAULT_MODEL,
-    signal: new AbortController().signal,
-    emit,
-    mcpManager: new StdioMcpProcessManager(env)
-  });
+  for (const [index, message] of messages.entries()) {
+    console.log(`\n=== TURN ${index + 1} ===`);
+    console.log(`Message: ${message}\n`);
+    const result = await driver.run({
+      user: { id: "dev-harness-user" },
+      sessionId: "dev-harness-session",
+      motionDoc,
+      message,
+      llmApiKey: apiKey ?? "dev-oauth-placeholder",
+      model: env.DEFAULT_MODEL,
+      signal: new AbortController().signal,
+      emit,
+      mcpManager
+    });
+    motionDoc = result.motionDoc;
 
-  console.log("\n\n=== RESULT ===");
-  console.log("assistantMessage:", result.assistantMessage);
-  console.log("motionDoc length:", result.motionDoc.length);
-  console.log("metadata:", JSON.stringify(result.metadata));
+    console.log("\nassistantMessage:", result.assistantMessage);
+    console.log("motionDoc length:", motionDoc.length);
+    console.log("metadata:", JSON.stringify(result.metadata));
+  }
+
   console.log("\n=== MotionDoc ===\n");
-  console.log(result.motionDoc);
+  console.log(motionDoc);
+}
+
+function readMessages(args: string[]): string[] {
+  const raw = args.join(" ").trim();
+  if (!raw) {
+    return ["Create a 5-slide pitch deck for SlideX."];
+  }
+
+  return raw
+    .split(/\s+--then\s+/)
+    .map((message) => message.trim())
+    .filter(Boolean);
 }
 
 main().catch((error) => {

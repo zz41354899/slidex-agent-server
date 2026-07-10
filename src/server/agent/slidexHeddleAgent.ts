@@ -4,23 +4,33 @@ import type {
   ConversationTurnResultSummary,
   ToolApprovalPolicyContext
 } from "@roackb2/heddle";
-import type { ChatMessage } from "../../shared/schema.js";
 import type { AgentEmit, AgentRunResult } from "./types.js";
 
 /**
  * The production SlideX conversational agent, built on Heddle.
  *
  * Responsibilities that are genuinely SlideX-specific live here (not in Heddle):
- * how to seed the current MotionDoc into a turn, which tool results carry the
- * updated deck, and how to translate Heddle's activity stream into the server's
- * transport-level progress events. The engine (with the self-contained SlideX
- * MCP host extension) is constructed by the driver and passed in.
+ * how to seed the authoritative current MotionDoc into a turn, resolve the
+ * mirrored deck outcome, and translate Heddle's activity stream into the
+ * server's transport-level progress events. The engine (with the self-contained
+ * SlideX MCP host extension) is constructed by the driver and passed in.
  */
 
 // Minimal structural view of the Heddle engine surface we use, so this module
 // does not couple to Heddle's full engine type.
 export type ConversationEngineLike = {
-  sessions: { create(input: { name?: string }): { id: string } };
+  sessions: {
+    listExisting(): Array<{ id: string; model?: string }>;
+    create(input: {
+      id?: string;
+      name?: string;
+      model?: string;
+    }): { id: string; model?: string };
+    updateSettings(
+      id: string,
+      input: { model?: string }
+    ): { id: string; model?: string };
+  };
   turns: {
     submit(input: {
       sessionId: string;
@@ -30,7 +40,10 @@ export type ConversationEngineLike = {
       host?: ConversationEngineHost;
     }): Promise<ConversationTurnResultSummary>;
   };
-  artifacts: { read(id: string): { content: string } | undefined };
+  artifacts: {
+    current(sessionId: string): { id: string } | undefined;
+    read(id: string): { content: string } | undefined;
+  };
 };
 
 export type RunSlideXAgentArgs = {
@@ -38,27 +51,11 @@ export type RunSlideXAgentArgs = {
   sessionId: string;
   motionDoc: string;
   message: string;
-  history: ChatMessage[];
+  model: string;
   maxSteps?: number;
   signal: AbortSignal;
   emit: AgentEmit;
 };
-
-// SlideX MCP tools whose result carries the full updated deck source. The last
-// successful one in a turn is the new MotionDoc. (Read-only tools like
-// slidex_get_template also return a `source`, so we don't treat those as edits.)
-const MOTIONDOC_MUTATING_TOOLS = new Set([
-  "slidex_create_deck",
-  "slidex_create_from_template",
-  "slidex_replace_slide",
-  "slidex_update_slide_props",
-  "slidex_add_block",
-  "slidex_delete_slide",
-  "slidex_reorder_slide",
-  "slidex_create_slide_from_layout",
-  "slidex_add_slide_from_layout",
-  "slidex_replace_slide_with_layout"
-]);
 
 const DEFAULT_MAX_STEPS = 24;
 
@@ -67,7 +64,8 @@ export async function runSlideXAgent(args: RunSlideXAgentArgs): Promise<AgentRun
 
   await emit({ type: "status", message: "Starting SlideX agent turn" });
 
-  const session = engine.sessions.create({ name: `SlideX session ${args.sessionId}` });
+  const session = resolveConversationSession(engine, args.sessionId, args.model);
+  const previousArtifactId = engine.artifacts.current(session.id)?.id;
 
   const host = createProgressHost(emit);
 
@@ -79,7 +77,7 @@ export async function runSlideXAgent(args: RunSlideXAgentArgs): Promise<AgentRun
     host
   });
 
-  const motionDoc = extractFinalMotionDoc(engine, result, args.motionDoc);
+  const motionDoc = resolveMotionDoc(engine, session.id, previousArtifactId, args.motionDoc);
   if (motionDoc !== args.motionDoc) {
     await emit({ type: "motionDoc", motionDoc });
   }
@@ -169,14 +167,6 @@ async function emitForActivity(
 function buildPrompt(args: RunSlideXAgentArgs): string {
   const lines: string[] = [];
 
-  if (args.history.length > 0) {
-    lines.push("Conversation so far:");
-    for (const message of args.history) {
-      lines.push(`${message.role === "assistant" ? "Assistant" : "User"}: ${message.content}`);
-    }
-    lines.push("");
-  }
-
   const trimmedDoc = args.motionDoc.trim();
   if (trimmedDoc) {
     lines.push("Current MotionDoc source (edit from this exact base and pass it into SlideX tools):");
@@ -198,56 +188,41 @@ function buildPrompt(args: RunSlideXAgentArgs): string {
   return lines.join("\n");
 }
 
-/**
- * The updated deck is the `source` returned by the last successful MotionDoc-
- * mutating tool call this turn. With result-artifact capture disabled, that
- * `source` is inline; we still resolve an artifact reference defensively.
- */
-function extractFinalMotionDoc(
+function resolveConversationSession(
   engine: ConversationEngineLike,
-  result: ConversationTurnResultSummary,
+  slideXSessionId: string,
+  model: string
+): { id: string } {
+  const sessionId = `slidex-${slideXSessionId}`;
+  const existing = engine.sessions.listExisting().find((session) => session.id === sessionId);
+  if (!existing) {
+    return engine.sessions.create({
+      id: sessionId,
+      name: `SlideX session ${slideXSessionId}`,
+      model
+    });
+  }
+
+  return existing.model === model
+    ? existing
+    : engine.sessions.updateSettings(existing.id, { model });
+}
+
+function resolveMotionDoc(
+  engine: ConversationEngineLike,
+  sessionId: string,
+  previousArtifactId: string | undefined,
   fallback: string
 ): string {
-  for (let i = result.toolResults.length - 1; i >= 0; i -= 1) {
-    const entry = result.toolResults[i];
-    if (!entry || entry.result.ok === false) {
-      continue;
-    }
-    if (!MOTIONDOC_MUTATING_TOOLS.has(entry.call.tool)) {
-      continue;
-    }
-    const source = readSource(engine, entry.result.output);
-    if (source) {
-      return source;
-    }
+  const currentArtifact = engine.artifacts.current(sessionId);
+  if (!currentArtifact || currentArtifact.id === previousArtifactId) {
+    return fallback;
   }
-  return fallback;
-}
 
-function readSource(engine: ConversationEngineLike, output: unknown): string | undefined {
-  const source = getPath(output, ["structuredContent", "result", "source"]);
-  if (typeof source === "string" && source.trim()) {
-    return source;
+  const content = engine.artifacts.read(currentArtifact.id)?.content;
+  if (!content?.trim()) {
+    throw new Error(`Current MotionDoc artifact ${currentArtifact.id} could not be read`);
   }
-  // Defensive: if a future config re-enables artifact capture, `source` becomes
-  // a reference object; resolve it through the engine artifact reader.
-  const artifactId = getPath(source, ["artifact", "id"]);
-  if (typeof artifactId === "string") {
-    const read = engine.artifacts.read(artifactId);
-    if (read?.content) {
-      return read.content;
-    }
-  }
-  return undefined;
-}
 
-function getPath(value: unknown, keys: string[]): unknown {
-  let current = value;
-  for (const key of keys) {
-    if (!current || typeof current !== "object") {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[key];
-  }
-  return current;
+  return content;
 }

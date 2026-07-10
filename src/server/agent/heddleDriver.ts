@@ -13,8 +13,9 @@ import type { AgentDriver } from "./types.js";
  * SlideX MCP host extension ONCE (shared across all requests), then builds a
  * fresh, user-scoped conversation engine per request — the user's API key, a
  * per-user/session state root, and the shared extension — and delegates the turn
- * to the SlideX agent module. Heddle owns the MCP subprocess lifecycle via the
- * extension, so the server's StdioMcpProcessManager is not used on this path.
+ * to the SlideX agent module. The stable state root lets each fresh engine reuse
+ * the same durable Heddle conversation. Heddle owns the MCP subprocess lifecycle
+ * via the extension, so the server's StdioMcpProcessManager is not used here.
  */
 export function createHeddleDriver(env: Env): AgentDriver {
   return {
@@ -68,7 +69,7 @@ export function createHeddleDriver(env: Env): AgentDriver {
         sessionId: args.sessionId,
         motionDoc: args.motionDoc,
         message: args.message,
-        history: args.history,
+        model: args.model,
         signal: args.signal,
         emit: args.emit
       });

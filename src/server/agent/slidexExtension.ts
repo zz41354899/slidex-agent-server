@@ -1,6 +1,7 @@
 import path from "node:path";
 import {
   prepareMcpHostExtension,
+  type McpHostResultArtifactRule,
   type PrepareMcpHostExtensionResult
 } from "@roackb2/heddle";
 import type { Env } from "../env.js";
@@ -23,6 +24,30 @@ import type { Env } from "../env.js";
 
 const SLIDEX_SERVER_ID = "slidex";
 const EXTENSION_ID = "presentation-workspace";
+
+const MOTIONDOC_WRITER_TOOLS = [
+  "slidex_create_deck",
+  "slidex_create_from_template",
+  "slidex_replace_slide",
+  "slidex_update_slide_props",
+  "slidex_add_block",
+  "slidex_delete_slide",
+  "slidex_reorder_slide",
+  "slidex_create_slide_from_layout",
+  "slidex_add_slide_from_layout",
+  "slidex_replace_slide_with_layout"
+] as const;
+
+export const MOTIONDOC_RESULT_ARTIFACT_RULES: McpHostResultArtifactRule[] =
+  MOTIONDOC_WRITER_TOOLS.map((toolName) => ({
+    toolName,
+    path: "structuredContent.result.source",
+    mode: "mirror",
+    kind: "source",
+    domain: "slidex.motiondoc",
+    extension: "mdx",
+    setCurrent: true
+  }));
 
 export type PreparedSlideXExtension = Extract<PrepareMcpHostExtensionResult, { ok: true }>;
 
@@ -72,10 +97,10 @@ export async function prepareSlideXExtension(env: Env): Promise<PreparedSlideXEx
       },
       defaultCapabilities: ["workspace.read"],
       hideDefaultMcpTools: true,
-      // Keep MotionDoc source inline in tool results so the agent module can read
-      // the updated deck directly (no artifact indirection). The server persists
-      // decks itself, so Heddle artifacts are not needed here.
-      resultArtifacts: false,
+      // SlideX tools must keep the full MotionDoc inline for the next stateless
+      // edit call. Mirror capture also persists each update so the host can read
+      // the turn outcome through engine.artifacts.current(sessionId).
+      resultArtifacts: MOTIONDOC_RESULT_ARTIFACT_RULES,
       systemContext: [
         "You are operating a SlideX presentation workspace through host-provided SlideX MotionDoc tools.",
         "SlideX tools are stateless: pass the current MotionDoc MDX `source` into each tool and use the `source` it returns as the new deck.",
