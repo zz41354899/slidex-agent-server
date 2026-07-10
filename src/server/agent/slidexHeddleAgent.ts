@@ -165,27 +165,19 @@ async function emitForActivity(
 }
 
 function buildPrompt(args: RunSlideXAgentArgs): string {
-  const lines: string[] = [];
-
   const trimmedDoc = args.motionDoc.trim();
-  if (trimmedDoc) {
-    lines.push("Current MotionDoc source (edit from this exact base and pass it into SlideX tools):");
-    lines.push("```mdx");
-    lines.push(trimmedDoc);
-    lines.push("```");
-    lines.push("");
-  } else {
-    lines.push("There is no deck yet. Create a new MotionDoc for the request below.");
-    lines.push("");
-  }
+  const motionDocContext = trimmedDoc
+    ? `Current MotionDoc source (edit from this exact base and pass it into SlideX tools):
+~~~mdx
+${trimmedDoc}
+~~~`
+    : "There is no deck yet. Create a new MotionDoc for the request below.";
 
-  lines.push(`User request: ${args.message}`);
-  lines.push("");
-  lines.push(
-    "Use the SlideX MotionDoc tools to fulfill the request, validate the result, and reply with a short summary of what changed."
-  );
+  return `${motionDocContext}
 
-  return lines.join("\n");
+User request: ${args.message}
+
+Use the SlideX MotionDoc tools to fulfill the request, validate the result, and reply with a short summary of what changed.`;
 }
 
 function resolveConversationSession(
