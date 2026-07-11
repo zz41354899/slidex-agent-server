@@ -100,6 +100,17 @@ bodies, and defense-in-depth redaction covers bearer credentials, cookies, and
 must not be logged. Set `LOG_LEVEL` to `fatal`, `error`, `warn`, `info`,
 `debug`, `trace`, or `silent`; production defaults to `info`.
 
+## Process lifecycle
+
+On `SIGTERM` or `SIGINT`, the server immediately stops accepting new HTTP
+connections and lets active requests—including an agent event stream—finish
+for up to `SHUTDOWN_GRACE_MS` (default 30 seconds). It then force-closes any
+remaining HTTP connections, stops owned subprocess resources, flushes logs,
+and exits. Repeated signals join the same shutdown instead of running cleanup
+twice. A forced close does not cancel a model/provider operation outside the
+process; durable conversation history remains available after restart, while
+process-local live-run replay does not.
+
 ## Railway
 
 Railway deploys from `railway.json` and `Dockerfile`.
@@ -115,6 +126,7 @@ VITE_SUPABASE_URL=...
 VITE_SUPABASE_ANON_KEY=...
 DEFAULT_MODEL=gpt-4.1
 LOG_LEVEL=info
+SHUTDOWN_GRACE_MS=30000
 HEDDLE_WORKSPACE_ROOT=/app
 MOTIONDOC_MCP_COMMAND=...
 MOTIONDOC_MCP_ARGS=...
