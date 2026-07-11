@@ -14,7 +14,7 @@ This directory owns the SlideX-specific orchestration around the Heddle SDK.
   while clients migrate to the reconnectable run protocol.
 
 The public run envelope and runtime payload validation come from
-`@roackb2/heddle/remote`. HTTP/SSE handles, authentication, and route policy
+`@roackb2/heddle-remote`. HTTP/SSE handles, authentication, and route policy
 remain in `server/routes`. MotionDoc editing logic belongs in the MCP extension.
 The shared schema projects Heddle's rich internal activities to the small
 JSON-safe shape consumed by SlideX (`type`, `text`, `tool`, and `result.ok`);

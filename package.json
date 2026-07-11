@@ -17,7 +17,8 @@
     "try:agent": "tsx scripts/trySlidexAgent.ts"
   },
   "dependencies": {
-    "@roackb2/heddle": "git+https://github.com/roackb2/heddle.git#1a8cb3b1fe563daf58416fc41fc9158182b11c58",
+    "@roackb2/heddle": "4.3.0",
+    "@roackb2/heddle-remote": "4.3.0",
     "@supabase/supabase-js": "^2.45.0",
     "@trpc/client": "^10.45.2",
     "@trpc/server": "^10.45.2",

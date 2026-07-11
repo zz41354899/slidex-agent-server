@@ -2,7 +2,7 @@ import { z } from "zod";
 import {
   ConversationRunProtocolCodec,
   type ConversationRunProtocolEvent
-} from "@roackb2/heddle/remote";
+} from "@roackb2/heddle-remote";
 
 export const ChatRoleSchema = z.enum(["user", "assistant", "system", "tool"]);
 
