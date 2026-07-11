@@ -12,7 +12,17 @@ const EnvSchema = z.object({
   AGENT_DRIVER: z.enum(["mock", "heddle"]).optional(),
   DEFAULT_MODEL: z.string().min(1).default("gpt-4.1"),
   HEDDLE_WORKSPACE_ROOT: z.string().optional(),
-  JAY_AGENT_MODULE_PATH: z.string().optional(),
+  // Dev-only: skip Supabase auth and treat every request as a fixed local user.
+  // Ignored in production (see AuthService). Handy when you don't have Supabase.
+  DEV_AUTH_BYPASS: z.string().optional(),
+  DEV_USER_ID: z.string().optional(),
+  DEV_USER_EMAIL: z.string().optional(),
+  // Dev-only: path to a Heddle auth.json with an OpenAI OAuth login (e.g. a
+  // Codex subscription via `npx heddle auth login openai`). When set (and not
+  // production), the Heddle driver ignores the per-request llmApiKey and lets
+  // Heddle resolve the OAuth credential instead — so features can be tested
+  // without API-key billing. Production always uses the per-request key.
+  DEV_HEDDLE_AUTH_STORE: z.string().optional(),
   MOTIONDOC_MCP_COMMAND: z.string().optional(),
   MOTIONDOC_MCP_ARGS: z.string().optional(),
   MOTIONDOC_MCP_CWD: z.string().optional()
