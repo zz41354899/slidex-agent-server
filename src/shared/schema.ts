@@ -68,6 +68,37 @@ export const StartAgentRunResultSchema = z.object({
   session: SessionSchema
 });
 
+export const ActiveAgentRunSchema = z.object({
+  runId: z.string().min(1),
+  acceptedAt: z.string().min(1)
+});
+
+export const AgentSessionStateSchema = z.object({
+  session: SessionSchema,
+  activeRun: ActiveAgentRunSchema.nullable()
+});
+
+export const ResetAgentSessionResultSchema = z.object({
+  reset: z.literal(true)
+});
+
+export const AgentApiErrorCodeSchema = z.enum([
+  "auth_required",
+  "invalid_request",
+  "session_not_found",
+  "run_not_found",
+  "active_run_conflict",
+  "replay_unavailable",
+  "internal_error"
+]);
+
+export const AgentApiErrorResponseSchema = z.object({
+  error: z.object({
+    code: AgentApiErrorCodeSchema,
+    message: z.string().min(1)
+  })
+});
+
 export const PublicConversationActivitySchema = z
   .object({
     type: z.string(),
@@ -134,6 +165,8 @@ export type AgentStreamInput = z.infer<typeof AgentStreamInputSchema>;
 export type AgentStreamEvent = z.infer<typeof AgentStreamEventSchema>;
 export type StartAgentRunInput = z.infer<typeof StartAgentRunInputSchema>;
 export type StartAgentRunResult = z.infer<typeof StartAgentRunResultSchema>;
+export type AgentSessionState = z.infer<typeof AgentSessionStateSchema>;
+export type AgentApiErrorCode = z.infer<typeof AgentApiErrorCodeSchema>;
 export type AgentRunEvent = ConversationRunProtocolEvent<
   z.infer<typeof PublicConversationActivitySchema>,
   z.infer<typeof SlideXRunResultSchema>

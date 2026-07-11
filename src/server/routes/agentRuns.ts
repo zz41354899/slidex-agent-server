@@ -1,14 +1,21 @@
 import { once } from "node:events";
 import type { Request, Response } from "express";
+import { ZodError } from "zod";
 import {
+  AgentApiErrorResponseSchema,
+  AgentSessionStateSchema,
   AgentRunProtocol,
   AgentRunEventSchema,
+  ResetAgentSessionResultSchema,
   StartAgentRunInputSchema,
-  StartAgentRunResultSchema
+  StartAgentRunResultSchema,
+  type AgentApiErrorCode
 } from "../../shared/schema.js";
 import { AuthError, type AuthService } from "../auth.js";
-import type { SlideXAgentRunService } from "../agent/slidexAgentRunService.js";
-import { toPublicErrorMessage } from "./agentStream.js";
+import {
+  SlideXAgentRunServiceError,
+  type SlideXAgentRunService
+} from "../agent/slidexAgentRunService.js";
 
 export type AgentRunRouteDeps = {
   authService: AuthService;
@@ -70,6 +77,30 @@ export function createSubscribeAgentRunHandler(deps: AgentRunRouteDeps) {
   };
 }
 
+export function createGetAgentSessionHandler(deps: AgentRunRouteDeps) {
+  return async (req: Request, res: Response) => {
+    try {
+      const user = await deps.authService.requireUserFromRequest(req);
+      const state = await deps.agentRunService.getSessionState(user.id, requireSessionId(req));
+      res.json(AgentSessionStateSchema.parse(state));
+    } catch (error) {
+      sendRequestError(res, error);
+    }
+  };
+}
+
+export function createResetAgentSessionHandler(deps: AgentRunRouteDeps) {
+  return async (req: Request, res: Response) => {
+    try {
+      const user = await deps.authService.requireUserFromRequest(req);
+      const result = await deps.agentRunService.resetSession(user.id, requireSessionId(req));
+      res.json(ResetAgentSessionResultSchema.parse(result));
+    } catch (error) {
+      sendRequestError(res, error);
+    }
+  };
+}
+
 export function createCancelAgentRunHandler(deps: AgentRunRouteDeps) {
   return async (req: Request, res: Response) => {
     try {
@@ -114,9 +145,17 @@ function endResponse(res: Response): void {
 function requireRunId(req: Request): string {
   const runId = req.params.runId;
   if (!runId) {
-    throw new Error("Agent run id is required");
+    throw new SlideXAgentRunServiceError("invalid_request", "Agent run id is required");
   }
   return runId;
+}
+
+function requireSessionId(req: Request): string {
+  const sessionId = req.params.sessionId;
+  if (!sessionId) {
+    throw new SlideXAgentRunServiceError("invalid_request", "Conversation id is required");
+  }
+  return sessionId;
 }
 
 function parseReplayCursor(value: unknown): number | undefined {
@@ -125,12 +164,66 @@ function parseReplayCursor(value: unknown): number | undefined {
   }
   const cursor = Number(value);
   if (!Number.isSafeInteger(cursor) || cursor < 0) {
-    throw new Error("Agent run replay cursor must be a non-negative integer");
+    throw new SlideXAgentRunServiceError(
+      "invalid_request",
+      "Agent run replay cursor must be a non-negative integer"
+    );
   }
   return cursor;
 }
 
 function sendRequestError(res: Response, error: unknown): void {
-  const status = error instanceof AuthError ? 401 : 400;
-  res.status(status).json({ error: toPublicErrorMessage(error) });
+  const response = toAgentApiError(error);
+  if (response.code === "internal_error") {
+    console.error("[agent-runs] Request failed", error);
+  }
+  res.status(response.status).json(AgentApiErrorResponseSchema.parse({
+    error: {
+      code: response.code,
+      message: response.message
+    }
+  }));
+}
+
+const ERROR_STATUS = {
+  auth_required: 401,
+  invalid_request: 400,
+  session_not_found: 404,
+  run_not_found: 404,
+  active_run_conflict: 409,
+  replay_unavailable: 409,
+  internal_error: 500
+} satisfies Record<AgentApiErrorCode, number>;
+
+function toAgentApiError(error: unknown): {
+  code: AgentApiErrorCode;
+  message: string;
+  status: number;
+} {
+  if (error instanceof AuthError) {
+    return {
+      code: "auth_required",
+      message: "Authentication required",
+      status: ERROR_STATUS.auth_required
+    };
+  }
+  if (error instanceof SlideXAgentRunServiceError) {
+    return {
+      code: error.code,
+      message: error.message,
+      status: ERROR_STATUS[error.code]
+    };
+  }
+  if (error instanceof ZodError) {
+    return {
+      code: "invalid_request",
+      message: "The agent request was invalid",
+      status: ERROR_STATUS.invalid_request
+    };
+  }
+  return {
+    code: "internal_error",
+    message: "The agent service could not complete the request",
+    status: ERROR_STATUS.internal_error
+  };
 }
