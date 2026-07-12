@@ -18,7 +18,8 @@ import { AgentRunProtocol } from "../../shared/schema.js";
 import {
   SlideXAgentRunService,
   SlideXAgentRunServiceError,
-  type AgentRunLogger
+  type AgentRunLogger,
+  type SlideXAgentRunServiceOptions
 } from "./slidexAgentRunService.js";
 
 test("streams a reconnectable run and persists the completed SlideX session", async () => {
@@ -271,6 +272,87 @@ test("sanitizes run failures and persists their terminal meaning", async () => {
   }
 });
 
+test("turns a rejected BYOK credential into a stable actionable terminal", async () => {
+  const fixture = await createFixture(createEngine(async () => ({
+    ...createTurnResult(),
+    outcome: "error",
+    summary: "LLM error: sensitive provider authentication detail",
+    failure: { source: "model", code: "authentication" }
+  })));
+  try {
+    const accepted = await fixture.service.start(fixture.user, {
+      message: "Update it",
+      motionDoc: "# Original deck",
+      sourceRevision: "revision-1",
+      llmApiKey: "rejected-api-key"
+    });
+    const events = await collect(fixture.service.subscribe({
+      userId: fixture.user.id,
+      runId: accepted.runId
+    }));
+    const terminal = events.at(-1);
+
+    assert.ok(terminal && terminal.kind === "error");
+    assert.deepEqual(terminal.error, {
+      code: "model_credential_rejected",
+      message: "OpenAI rejected this API key. Check the key and try again."
+    });
+    assert.doesNotMatch(JSON.stringify(terminal), /sensitive provider/);
+
+    const state = await fixture.service.getSessionState(fixture.user.id, accepted.session.id);
+    assert.equal(
+      state.session.messages.at(-1)?.content,
+      "OpenAI rejected this API key. Check the key and try again."
+    );
+    assert.equal(
+      state.session.messages.at(-1)?.metadata?.errorCode,
+      "model_credential_rejected"
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("never exposes or persists the ephemeral model key", async () => {
+  const sentinel = "sk-sentinel-ephemeral-only-123456";
+  const records: Array<Record<string, unknown>> = [];
+  const logger: AgentRunLogger = {
+    info: (fields) => records.push(fields),
+    warn: (fields) => records.push(fields)
+  };
+  const engine = createEngine();
+  let receivedKey: string | undefined;
+  const createEngineWithSentinel: NonNullable<SlideXAgentRunServiceOptions["createEngine"]> =
+    async (_env, input) => {
+      receivedKey = input.llmApiKey;
+      return engine;
+    };
+  const fixture = await createFixture(engine, logger, createEngineWithSentinel);
+
+  try {
+    const accepted = await fixture.service.start(fixture.user, {
+      message: "Keep the credential out of durable state",
+      motionDoc: "# Original deck",
+      sourceRevision: "revision-1",
+      llmApiKey: sentinel
+    });
+    const events = await collect(fixture.service.subscribe({
+      userId: fixture.user.id,
+      runId: accepted.runId
+    }));
+    const state = await fixture.service.getSessionState(fixture.user.id, accepted.session.id);
+    const persistedFiles = await readUtf8Files(fixture.root);
+
+    assert.equal(receivedKey, sentinel);
+    assert.doesNotMatch(
+      JSON.stringify({ accepted, events, state, records, persistedFiles }),
+      new RegExp(sentinel)
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("keeps result persistence failures distinct without exposing storage details", async () => {
   const turn = deferred<void>();
   const fixture = await createFixture(createEngine(async () => {
@@ -376,7 +458,8 @@ test("projects Heddle activities to the JSON-safe public client shape", () => {
 
 async function createFixture(
   engine = createEngine(),
-  logger?: AgentRunLogger
+  logger?: AgentRunLogger,
+  createEngineFactory?: NonNullable<SlideXAgentRunServiceOptions["createEngine"]>
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "slidex-agent-run-"));
   const sessionStore = new SessionStore(root);
@@ -390,10 +473,22 @@ async function createFixture(
       dataDir: root
     } as Env,
     sessionStore,
-    createEngine: async () => engine,
+    createEngine: createEngineFactory ?? (async () => engine),
     logger
   });
   return { root, service, sessionStore, user };
+}
+
+async function readUtf8Files(root: string): Promise<Array<{ path: string; content: string }>> {
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const files = await Promise.all(entries.map(async (entry) => {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      return readUtf8Files(entryPath);
+    }
+    return [{ path: entryPath, content: await fs.readFile(entryPath, "utf8") }];
+  }));
+  return files.flat();
 }
 
 function createEngine(

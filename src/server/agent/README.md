@@ -36,7 +36,15 @@ behavior must be added to Heddle, not reimplemented here.
 Accepted user messages and success, cancellation, or failure terminals are
 persisted as one explainable product history. Reset marks an in-flight address
 before deleting its session so a late result cannot recreate deleted state.
+The run-start request is the only SlideX boundary that accepts a user model
+credential. The service passes it directly into the request-scoped engine and
+retains only non-secret lifecycle fields. The key must never enter product
+sessions, run results/events, Heddle traces or artifacts, logs, or error
+messages. Heddle's safe `result.failure` category is the source of truth for
+credential rejection; do not parse provider strings or add another HTTP-status
+classifier here.
 The route layer maps the service's stable product errors to HTTP status codes
 and sanitizes unknown failures. Structured lifecycle logs contain only stable
-correlation and outcome facts; prompts, MotionDoc source, credentials, user
-identity, and raw provider/runtime errors must never be logged.
+correlation, outcome, and safe product error-code facts; prompts, MotionDoc
+source, credentials, user identity, and raw provider/runtime errors must never
+be logged.
