@@ -1,5 +1,4 @@
 import type { AuthUser } from "../auth.js";
-import type { StdioMcpProcessManager } from "../mcp/stdioMcp.js";
 
 export type AgentEmit = (event: AgentProgressEvent) => void | Promise<void>;
 
@@ -23,7 +22,6 @@ export type AgentRunArgs = {
   model: string;
   signal: AbortSignal;
   emit: AgentEmit;
-  mcpManager: StdioMcpProcessManager;
 };
 
 export type AgentRunResult = {

@@ -59,7 +59,6 @@ export function createAgentStreamHandler(deps: AgentStreamDeps) {
         llmApiKey: input.llmApiKey,
         model: input.model || deps.env.DEFAULT_MODEL,
         signal: abortController.signal,
-        mcpManager: deps.mcpManager,
         emit: async (event) => {
           if (event.type === "token") {
             streamedAssistantText += event.text;

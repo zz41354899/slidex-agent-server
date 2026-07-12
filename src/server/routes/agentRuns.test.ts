@@ -11,8 +11,13 @@ import { loadEnv, type Env } from "../env.js";
 import { StdioMcpProcessManager } from "../mcp/stdioMcp.js";
 import { SessionStore } from "../storage/sessionStore.js";
 import type { SlideXAgentRunService } from "../agent/slidexAgentRunService.js";
-import type { AgentRunEvent } from "../../shared/schema.js";
+import { SlideXAgentRunServiceError } from "../agent/slidexAgentRunService.js";
+import type { AgentRunEvent, Session } from "../../shared/schema.js";
 import {
+  createCancelAgentRunHandler,
+  createGetAgentSessionHandler,
+  createResetAgentSessionHandler,
+  createStartAgentRunHandler,
   createSubscribeAgentRunHandler,
   type AgentRunRouteDeps
 } from "./agentRuns.js";
@@ -35,18 +40,22 @@ test("defaults the reconnectable run API flag to disabled", () => {
 test("keeps the reconnectable run API hidden while preserving the legacy stream when disabled", async () => {
   await withAgentFeature(false, async (baseUrl) => {
     const runResponse = await postJson(`${baseUrl}/api/agent/runs`);
+    const sessionResponse = await fetch(`${baseUrl}/api/agent/sessions/session-1`);
     const legacyResponse = await postJson(`${baseUrl}/api/agent/stream`);
 
     assert.equal(runResponse.status, 404);
+    assert.equal(sessionResponse.status, 404);
     assert.equal(legacyResponse.status, 401);
   });
 });
 
 test("registers the reconnectable run API when explicitly enabled", async () => {
   await withAgentFeature(true, async (baseUrl) => {
-    const response = await postJson(`${baseUrl}/api/agent/runs`);
+    const runResponse = await postJson(`${baseUrl}/api/agent/runs`);
+    const sessionResponse = await fetch(`${baseUrl}/api/agent/sessions/session-1`);
 
-    assert.equal(response.status, 401);
+    assert.equal(runResponse.status, 401);
+    assert.equal(sessionResponse.status, 401);
   });
 });
 
@@ -106,12 +115,143 @@ test("streams canonical SSE frames and resumes from Last-Event-ID", async () => 
   }
 });
 
+test("reads and resets authenticated conversation state", async () => {
+  const session = createSession();
+  let resetSessionId: string | undefined;
+  const app = createRouteApp({
+    getSessionState: async (_userId: string, sessionId: string) => ({
+      session: { ...session, id: sessionId },
+      activeRun: { runId: "run-1", acceptedAt: "2026-07-11T00:00:00.000Z" }
+    }),
+    resetSession: async (_userId: string, sessionId: string) => {
+      resetSessionId = sessionId;
+      return { reset: true as const };
+    }
+  });
+
+  await withHttpServer(app, async (baseUrl) => {
+    const stateResponse = await fetch(`${baseUrl}/api/agent/sessions/session-1`);
+    assert.equal(stateResponse.status, 200);
+    assert.deepEqual(await stateResponse.json(), {
+      session,
+      activeRun: { runId: "run-1", acceptedAt: "2026-07-11T00:00:00.000Z" }
+    });
+
+    const resetResponse = await fetch(`${baseUrl}/api/agent/sessions/session-1`, {
+      method: "DELETE"
+    });
+    assert.equal(resetResponse.status, 200);
+    assert.deepEqual(await resetResponse.json(), { reset: true });
+    assert.equal(resetSessionId, "session-1");
+  });
+});
+
+test("returns stable 404, 409, 400, and sanitized 500 errors", async () => {
+  const app = createRouteApp({
+    getSessionState: async () => {
+      throw new SlideXAgentRunServiceError("session_not_found", "Conversation not found");
+    },
+    start: async () => {
+      throw new SlideXAgentRunServiceError(
+        "active_run_conflict",
+        "An agent run is already in progress for this conversation"
+      );
+    },
+    cancel: () => {
+      throw new Error("private provider detail");
+    }
+  });
+
+  await withHttpServer(app, async (baseUrl) => {
+    const missing = await fetch(`${baseUrl}/api/agent/sessions/missing`);
+    assert.equal(missing.status, 404);
+    assert.deepEqual(await missing.json(), {
+      error: { code: "session_not_found", message: "Conversation not found" }
+    });
+
+    const conflict = await fetch(`${baseUrl}/api/agent/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: "session-1",
+        message: "Update it",
+        motionDoc: "# Deck",
+        sourceRevision: "revision-1",
+        llmApiKey: "test-api-key"
+      })
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal(await readErrorCode(conflict), "active_run_conflict");
+
+    const invalidCursor = await fetch(`${baseUrl}/api/agent/runs/run-1/events?after=nope`);
+    assert.equal(invalidCursor.status, 400);
+    assert.equal(await readErrorCode(invalidCursor), "invalid_request");
+
+    const internal = await fetch(`${baseUrl}/api/agent/runs/run-1/cancel`, { method: "POST" });
+    assert.equal(internal.status, 500);
+    const internalBody = await internal.json();
+    assert.deepEqual(internalBody, {
+      error: {
+        code: "internal_error",
+        message: "The agent service could not complete the request"
+      }
+    });
+    assert.doesNotMatch(JSON.stringify(internalBody), /private provider detail/);
+  });
+});
+
 function toAsyncIterable(events: AgentRunEvent[]): AsyncIterable<AgentRunEvent> {
   return {
     async *[Symbol.asyncIterator]() {
       yield* events;
     }
   };
+}
+
+function createRouteApp(service: Partial<SlideXAgentRunService>) {
+  const deps = {
+    authService: {
+      requireUserFromRequest: async () => ({ id: "user-1" })
+    } as unknown as AuthService,
+    agentRunService: service as SlideXAgentRunService
+  } satisfies AgentRunRouteDeps;
+  const app = express();
+  app.use(express.json());
+  app.post("/api/agent/runs", createStartAgentRunHandler(deps));
+  app.get("/api/agent/runs/:runId/events", createSubscribeAgentRunHandler(deps));
+  app.post("/api/agent/runs/:runId/cancel", createCancelAgentRunHandler(deps));
+  app.get("/api/agent/sessions/:sessionId", createGetAgentSessionHandler(deps));
+  app.delete("/api/agent/sessions/:sessionId", createResetAgentSessionHandler(deps));
+  return app;
+}
+
+function createSession(): Session {
+  return {
+    id: "session-1",
+    userId: "user-1",
+    title: "Deck",
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z",
+    latestMotionDoc: "# Deck",
+    messages: []
+  };
+}
+
+async function withHttpServer(
+  app: express.Express,
+  run: (baseUrl: string) => Promise<void>
+): Promise<void> {
+  const server = app.listen(0);
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
 }
 
 function parseSseFrames(text: string) {
@@ -172,4 +312,9 @@ function postJson(url: string): Promise<Response> {
     headers: { "content-type": "application/json" },
     body: "{}"
   });
+}
+
+async function readErrorCode(response: Response): Promise<string | undefined> {
+  const body = await response.json() as { error?: { code?: string } };
+  return body.error?.code;
 }

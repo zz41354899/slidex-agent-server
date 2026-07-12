@@ -13,7 +13,6 @@
  */
 import "dotenv/config";
 import { createHeddleDriver } from "../src/server/agent/heddleDriver.js";
-import { StdioMcpProcessManager } from "../src/server/mcp/stdioMcp.js";
 import { loadEnv } from "../src/server/env.js";
 import type { AgentProgressEvent } from "../src/server/agent/types.js";
 
@@ -51,7 +50,6 @@ async function main(): Promise<void> {
 
   console.log(`Model: ${env.DEFAULT_MODEL}`);
   console.log(`MCP: ${env.MOTIONDOC_MCP_COMMAND} ${env.MOTIONDOC_MCP_ARGS ?? ""}`);
-  const mcpManager = new StdioMcpProcessManager(env);
   let motionDoc = "";
 
   for (const [index, message] of messages.entries()) {
@@ -65,8 +63,7 @@ async function main(): Promise<void> {
       llmApiKey: apiKey ?? "dev-oauth-placeholder",
       model: env.DEFAULT_MODEL,
       signal: new AbortController().signal,
-      emit,
-      mcpManager
+      emit
     });
     motionDoc = result.motionDoc;
 
