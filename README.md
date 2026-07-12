@@ -15,23 +15,32 @@ It includes:
 
 ## Local Setup
 
+The checked-in `.env.example` is a runnable, zero-credential mock profile. It
+uses API port `3010`, enables the reconnectable agent routes, accepts local
+browser origins, and turns on the development auth bypass. It never calls an
+LLM or starts the MotionDoc MCP.
+
 ```bash
 npm install
 cp .env.example .env
 npm test
-npm run dev
+npm run dev:server
 ```
 
-Set these values in `.env`:
+In the SlideX editor repository, add:
 
 ```bash
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-supabase-anon-key
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
+NEXT_PUBLIC_SLIDEX_AGENT_ENABLED=true
+NEXT_PUBLIC_SLIDEX_AGENT_SERVER_URL=http://localhost:3010
 ```
 
-The API server binds `PORT` (default 3000) and the Vite dev proxy reads the same `PORT`, so if 3000 is taken run `PORT=3010 npm run dev` and both move together. Vite auto-picks a free web port if 5173 is busy and prints the URL. If the API port is taken the server exits with a clear message telling you to set `PORT`.
+Then start the editor normally and use its Agent panel. To run this server
+repository's bundled Vite demo too, use `npm run dev`; that demo requires the
+`VITE_SUPABASE_*` values documented in `.env.example`.
+
+The API server binds `PORT` and the bundled Vite proxy reads the same value.
+If the selected API port is taken, change `PORT` in `.env`; the server exits
+with a clear bind error rather than silently choosing a different API port.
 
 ## Agent Modes
 
@@ -65,19 +74,20 @@ never replaces endpoint authentication.
 If you don't have Supabase set up, enable `DEV_AUTH_BYPASS=1` (dev only — it is ignored when `NODE_ENV=production`). Every request then authenticates as `DEV_USER_ID` (default `dev-user`), so you can drive the tRPC procedures, the web UI, and `/api/agent/stream` with no token. Example — the full agent stream over HTTP:
 
 ```bash
-DEV_AUTH_BYPASS=1 AGENT_DRIVER=mock npm run dev
-# in another shell (use the server port printed by `npm run dev`):
-curl -sN -X POST http://localhost:3000/api/agent/stream \
+DEV_AUTH_BYPASS=1 AGENT_DRIVER=mock npm run dev:server
+# in another shell (use the server port printed by `npm run dev:server`):
+curl -sN -X POST http://localhost:3010/api/agent/stream \
   -H 'content-type: application/json' \
   -d '{"message":"Create a deck about stateless agents","motionDoc":"","llmApiKey":"dummy-key-123456"}'
 ```
 
 With `AGENT_DRIVER=heddle` the same call runs the real agent (needs a valid `llmApiKey` in the body and `MOTIONDOC_MCP_*` configured).
 
-The dogfood branch pins an exact unpublished Heddle commit so the integration
-can be verified before npm publication. Replace that commit pin with the exact
-released npm version before making the coordinated PRs merge-ready. Set
-`AGENT_DRIVER=heddle` and point at the SlideX MotionDoc MCP command:
+For pre-publication dogfood, install exact locally packed Heddle tarballs with
+`npm install --no-save --package-lock=false /path/to/package.tgz`. Keep the
+committed manifests on registry versions; update them to the exact new release
+only after the local integration proof passes. Set `AGENT_DRIVER=heddle` and
+point at the SlideX MotionDoc MCP command:
 
 ```bash
 AGENT_DRIVER=heddle
