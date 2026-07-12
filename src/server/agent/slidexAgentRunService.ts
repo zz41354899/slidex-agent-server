@@ -1,8 +1,12 @@
-import type { ConversationEngine } from "@roackb2/heddle";
+import type {
+  ConversationEngine,
+  SubmitConversationTurnResult
+} from "@roackb2/heddle";
 import {
   ConversationRunConflictError,
   ConversationRunReplayUnavailableError,
   ConversationRunService,
+  type ConversationRunContext,
   type ConversationRunHandle
 } from "@roackb2/heddle/hosted";
 import type {
@@ -34,6 +38,19 @@ type SlideXRunResult = {
   motionDoc: string;
   assistantMessage: string;
   baseSourceRevision: string;
+};
+
+type SlideXRunLifecycleContext = {
+  acceptedSession?: Promise<Session>;
+  addressKey: string;
+  conversationId: string;
+  correlation: { correlationId?: string };
+  engine: ConversationEngine;
+  input: StartAgentRunInput;
+  model: string;
+  previousArtifactId?: string;
+  session: Session;
+  startedAt: number;
 };
 
 class SlideXAgentSessionResetError extends Error {}
@@ -131,8 +148,17 @@ export class SlideXAgentRunService {
     const conversation = resolveConversationSession(engine, session.id, model);
     const previousArtifactId = engine.artifacts.current(conversation.id)?.id;
 
-    const key = addressKey(address);
-    let acceptedSession: Promise<Session>;
+    const lifecycle: SlideXRunLifecycleContext = {
+      addressKey: addressKey(address),
+      conversationId: conversation.id,
+      correlation,
+      engine,
+      input,
+      model,
+      previousArtifactId,
+      session,
+      startedAt
+    };
     let run: ConversationRunHandle<SlideXRunAddress, SlideXRunResult>;
     try {
       run = this.runs.startTurn({
@@ -144,88 +170,11 @@ export class SlideXAgentRunService {
           maxSteps: 24,
           host: createSlideXApprovalHost()
         },
-        projectResult: async (turnResult, runContext) => {
-          if (this.resetAddresses.has(key)) {
-            throw new SlideXAgentSessionResetError();
-          }
-          try {
-            const currentSession = await acceptedSession;
-            const motionDoc = resolveMotionDoc(
-              engine,
-              conversation.id,
-              previousArtifactId,
-              input.motionDoc
-            );
-            currentSession.latestMotionDoc = motionDoc;
-            currentSession.messages.push(
-              makeMessage({
-                role: "assistant",
-                content: turnResult.summary,
-                metadata: {
-                  outcome: turnResult.outcome,
-                  runId: runContext.runId,
-                  toolCalls: turnResult.toolResults.length
-                }
-              })
-            );
-            const persistedSession = await this.options.sessionStore.writeSession(currentSession);
-            this.logger.info({
-              event: "agent_run.terminal",
-              runId: runContext.runId,
-              sessionId: session.id,
-              model,
-              outcome: turnResult.outcome,
-              durationMs: Date.now() - startedAt,
-              toolCallCount: turnResult.toolResults.length,
-              ...correlation
-            }, "Agent run completed");
-            return {
-              session: persistedSession,
-              motionDoc,
-              assistantMessage: turnResult.summary,
-              baseSourceRevision: input.sourceRevision
-            };
-          } catch {
-            throw new SlideXAgentResultFinalizationError();
-          }
-        },
-        onError: async (error, runContext) => {
-          const cancelled = runContext.controller.signal.aborted;
-          await this.persistTerminalFailure({
-            acceptedSession,
-            addressKey: key,
-            runId: runContext.runId,
-            cancelled
-          });
-          const fields = {
-            event: "agent_run.terminal",
-            runId: runContext.runId,
-            sessionId: session.id,
-            model,
-            outcome: cancelled ? "cancelled" : "error",
-            durationMs: Date.now() - startedAt,
-            ...correlation
-          };
-          if (cancelled) {
-            this.logger.info(fields, "Agent run cancelled");
-          } else if (error instanceof SlideXAgentResultFinalizationError) {
-            this.logger.warn(fields, "Agent run result finalization failed");
-          } else {
-            this.logger.warn(fields, "Agent run failed");
-          }
-        },
-        projectError: (error) => error instanceof SlideXAgentResultFinalizationError
-          ? {
-              code: "finalization_failed",
-              message: "The agent finished, but its deck result could not be saved"
-            }
-          : {
-              code: "run_failed",
-              message: "The agent could not complete this request. Try again."
-            },
-        onSettled: () => {
-          this.resetAddresses.delete(key);
-        }
+        onAccepted: this.handleRunAccepted.bind(this, lifecycle),
+        projectResult: this.handleRunResult.bind(this, lifecycle),
+        onError: this.handleRunError.bind(this, lifecycle),
+        projectError: this.projectRunError.bind(this),
+        onSettled: this.handleRunSettled.bind(this, lifecycle)
       });
     } catch (error) {
       if (error instanceof ConversationRunConflictError) {
@@ -237,20 +186,8 @@ export class SlideXAgentRunService {
       throw error;
     }
 
-    acceptedSession = this.persistAcceptedMessage(session, input, run.runId)
-      .then((persistedSession) => {
-        this.logger.info({
-          event: "agent_run.accepted",
-          runId: run.runId,
-          sessionId: session.id,
-          model,
-          ...correlation
-        }, "Agent run accepted");
-        return persistedSession;
-      });
-
     try {
-      const persistedSession = await acceptedSession;
+      const persistedSession = await this.requireAcceptedSession(lifecycle);
       return {
         accepted: true as const,
         runId: run.runId,
@@ -373,6 +310,132 @@ export class SlideXAgentRunService {
       metadata: { runId }
     }));
     return this.options.sessionStore.writeSession(session);
+  }
+
+  private handleRunAccepted(
+    lifecycle: SlideXRunLifecycleContext,
+    runContext: ConversationRunContext
+  ): void {
+    lifecycle.acceptedSession = this.persistAcceptedMessage(
+      lifecycle.session,
+      lifecycle.input,
+      runContext.runId
+    ).then((persistedSession) => {
+      this.logger.info({
+        event: "agent_run.accepted",
+        runId: runContext.runId,
+        sessionId: lifecycle.session.id,
+        model: lifecycle.model,
+        ...lifecycle.correlation
+      }, "Agent run accepted");
+      return persistedSession;
+    });
+  }
+
+  private async handleRunResult(
+    lifecycle: SlideXRunLifecycleContext,
+    turnResult: SubmitConversationTurnResult,
+    runContext: ConversationRunContext
+  ): Promise<SlideXRunResult> {
+    if (this.resetAddresses.has(lifecycle.addressKey)) {
+      throw new SlideXAgentSessionResetError();
+    }
+
+    try {
+      const currentSession = await this.requireAcceptedSession(lifecycle);
+      const motionDoc = resolveMotionDoc(
+        lifecycle.engine,
+        lifecycle.conversationId,
+        lifecycle.previousArtifactId,
+        lifecycle.input.motionDoc
+      );
+      currentSession.latestMotionDoc = motionDoc;
+      currentSession.messages.push(
+        makeMessage({
+          role: "assistant",
+          content: turnResult.summary,
+          metadata: {
+            outcome: turnResult.outcome,
+            runId: runContext.runId,
+            toolCalls: turnResult.toolResults.length
+          }
+        })
+      );
+      const persistedSession = await this.options.sessionStore.writeSession(currentSession);
+      this.logger.info({
+        event: "agent_run.terminal",
+        runId: runContext.runId,
+        sessionId: lifecycle.session.id,
+        model: lifecycle.model,
+        outcome: turnResult.outcome,
+        durationMs: Date.now() - lifecycle.startedAt,
+        toolCallCount: turnResult.toolResults.length,
+        ...lifecycle.correlation
+      }, "Agent run completed");
+      return {
+        session: persistedSession,
+        motionDoc,
+        assistantMessage: turnResult.summary,
+        baseSourceRevision: lifecycle.input.sourceRevision
+      };
+    } catch {
+      throw new SlideXAgentResultFinalizationError();
+    }
+  }
+
+  private async handleRunError(
+    lifecycle: SlideXRunLifecycleContext,
+    error: unknown,
+    runContext: ConversationRunContext
+  ): Promise<void> {
+    const cancelled = runContext.controller.signal.aborted;
+    await this.persistTerminalFailure({
+      acceptedSession: this.requireAcceptedSession(lifecycle),
+      addressKey: lifecycle.addressKey,
+      runId: runContext.runId,
+      cancelled
+    });
+    const fields = {
+      event: "agent_run.terminal",
+      runId: runContext.runId,
+      sessionId: lifecycle.session.id,
+      model: lifecycle.model,
+      outcome: cancelled ? "cancelled" : "error",
+      durationMs: Date.now() - lifecycle.startedAt,
+      ...lifecycle.correlation
+    };
+    if (cancelled) {
+      this.logger.info(fields, "Agent run cancelled");
+    } else if (error instanceof SlideXAgentResultFinalizationError) {
+      this.logger.warn(fields, "Agent run result finalization failed");
+    } else {
+      this.logger.warn(fields, "Agent run failed");
+    }
+  }
+
+  private projectRunError(error: unknown) {
+    return error instanceof SlideXAgentResultFinalizationError
+      ? {
+          code: "finalization_failed",
+          message: "The agent finished, but its deck result could not be saved"
+        }
+      : {
+          code: "run_failed",
+          message: "The agent could not complete this request. Try again."
+        };
+  }
+
+  private handleRunSettled(lifecycle: SlideXRunLifecycleContext): void {
+    this.resetAddresses.delete(lifecycle.addressKey);
+  }
+
+  private requireAcceptedSession(
+    lifecycle: SlideXRunLifecycleContext
+  ): Promise<Session> {
+    if (!lifecycle.acceptedSession) {
+      throw new SlideXAgentResultFinalizationError();
+    }
+    return lifecycle.acceptedSession;
   }
 
   private async persistTerminalFailure(input: {

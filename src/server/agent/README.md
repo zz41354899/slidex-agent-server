@@ -17,7 +17,9 @@ This directory owns the SlideX-specific orchestration around the Heddle SDK.
   result/error projection. Active-run lookup, retained-run authorization,
   terminal publication, replay expiry, and reset cancellation delegate to the
   existing Heddle run service; do not add a second run registry or terminal
-  event mapper.
+  event mapper. Register Heddle lifecycle hooks together in `start`, but keep
+  accepted, result, error, error-projection, and settled behavior in named
+  service methods rather than inline callbacks.
 - `types.ts` and `runtime.ts` retain the legacy request-bound streaming driver
   while clients migrate to the reconnectable run protocol.
 
