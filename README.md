@@ -103,7 +103,13 @@ The extension uses Heddle 4.2 mirror result-artifact rules for MotionDoc-writing
 
 Heddle owns the MCP subprocess lifecycle via the extension (spawned per tool call), so `MOTIONDOC_MCP_*` is just the command Heddle runs — the built-in `StdioMcpProcessManager` is not used on the Heddle path.
 
-The server never stores the user's LLM API key. It is accepted only in the stream request body and passed into `createConversationEngine({ apiKey, preferApiKey: true, model })` for that request.
+The server never stores the user's LLM API key. It is accepted only in the
+run-start request body, passed into
+`createConversationEngine({ apiKey, preferApiKey: true, model })` for that live
+run, and omitted from product sessions, run events/results, Heddle
+traces/artifacts, and logs. A rejected key becomes the stable
+`model_credential_rejected` run terminal without exposing the provider's raw
+error.
 
 Heddle's `stateRoot` is created per user/session under `DATA_DIR/heddle`, so its local state also lands on the Railway volume.
 

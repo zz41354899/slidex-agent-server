@@ -46,15 +46,18 @@ type SlideXRunLifecycleContext = {
   conversationId: string;
   correlation: { correlationId?: string };
   engine: ConversationEngine;
-  input: StartAgentRunInput;
+  initialMotionDoc: string;
+  message: string;
   model: string;
   previousArtifactId?: string;
   session: Session;
+  sourceRevision: string;
   startedAt: number;
 };
 
 class SlideXAgentSessionResetError extends Error {}
 class SlideXAgentResultFinalizationError extends Error {}
+class SlideXAgentModelCredentialError extends Error {}
 
 type CreateEngine = (
   env: Env,
@@ -77,6 +80,26 @@ const NOOP_LOGGER: AgentRunLogger = {
   info: () => undefined,
   warn: () => undefined
 };
+
+const MODEL_CREDENTIAL_REJECTED = {
+  code: "model_credential_rejected",
+  message: "OpenAI rejected this API key. Check the key and try again."
+} as const;
+
+const RUN_FAILED = {
+  code: "run_failed",
+  message: "The agent could not complete this request. Try again."
+} as const;
+
+const FINALIZATION_FAILED = {
+  code: "finalization_failed",
+  message: "The agent finished, but its deck result could not be saved"
+} as const;
+
+type SlideXRunPublicError =
+  | typeof MODEL_CREDENTIAL_REJECTED
+  | typeof RUN_FAILED
+  | typeof FINALIZATION_FAILED;
 
 export type SlideXAgentRunServiceOptions = {
   env: Env;
@@ -153,10 +176,12 @@ export class SlideXAgentRunService {
       conversationId: conversation.id,
       correlation,
       engine,
-      input,
+      initialMotionDoc: input.motionDoc,
+      message: input.message,
       model,
       previousArtifactId,
       session,
+      sourceRevision: input.sourceRevision,
       startedAt
     };
     let run: ConversationRunHandle<SlideXRunAddress, SlideXRunResult>;
@@ -300,7 +325,7 @@ export class SlideXAgentRunService {
 
   private persistAcceptedMessage(
     session: Session,
-    input: StartAgentRunInput,
+    input: { message: string; motionDoc: string },
     runId: string
   ): Promise<Session> {
     session.latestMotionDoc = input.motionDoc;
@@ -318,7 +343,10 @@ export class SlideXAgentRunService {
   ): void {
     lifecycle.acceptedSession = this.persistAcceptedMessage(
       lifecycle.session,
-      lifecycle.input,
+      {
+        message: lifecycle.message,
+        motionDoc: lifecycle.initialMotionDoc
+      },
       runContext.runId
     ).then((persistedSession) => {
       this.logger.info({
@@ -340,6 +368,13 @@ export class SlideXAgentRunService {
     if (this.resetAddresses.has(lifecycle.addressKey)) {
       throw new SlideXAgentSessionResetError();
     }
+    if (turnResult.failure?.source === "model"
+      && turnResult.failure.code === "authentication") {
+      throw new SlideXAgentModelCredentialError();
+    }
+    if (turnResult.outcome === "error") {
+      throw new Error("Agent run returned an error outcome");
+    }
 
     try {
       const currentSession = await this.requireAcceptedSession(lifecycle);
@@ -347,7 +382,7 @@ export class SlideXAgentRunService {
         lifecycle.engine,
         lifecycle.conversationId,
         lifecycle.previousArtifactId,
-        lifecycle.input.motionDoc
+        lifecycle.initialMotionDoc
       );
       currentSession.latestMotionDoc = motionDoc;
       currentSession.messages.push(
@@ -376,7 +411,7 @@ export class SlideXAgentRunService {
         session: persistedSession,
         motionDoc,
         assistantMessage: turnResult.summary,
-        baseSourceRevision: lifecycle.input.sourceRevision
+        baseSourceRevision: lifecycle.sourceRevision
       };
     } catch {
       throw new SlideXAgentResultFinalizationError();
@@ -389,11 +424,13 @@ export class SlideXAgentRunService {
     runContext: ConversationRunContext
   ): Promise<void> {
     const cancelled = runContext.controller.signal.aborted;
+    const publicError = cancelled ? undefined : this.projectRunError(error);
     await this.persistTerminalFailure({
       acceptedSession: this.requireAcceptedSession(lifecycle),
       addressKey: lifecycle.addressKey,
       runId: runContext.runId,
-      cancelled
+      cancelled,
+      publicError
     });
     const fields = {
       event: "agent_run.terminal",
@@ -401,6 +438,7 @@ export class SlideXAgentRunService {
       sessionId: lifecycle.session.id,
       model: lifecycle.model,
       outcome: cancelled ? "cancelled" : "error",
+      ...(publicError ? { errorCode: publicError.code } : {}),
       durationMs: Date.now() - lifecycle.startedAt,
       ...lifecycle.correlation
     };
@@ -413,16 +451,13 @@ export class SlideXAgentRunService {
     }
   }
 
-  private projectRunError(error: unknown) {
+  private projectRunError(error: unknown): SlideXRunPublicError {
+    if (error instanceof SlideXAgentModelCredentialError) {
+      return MODEL_CREDENTIAL_REJECTED;
+    }
     return error instanceof SlideXAgentResultFinalizationError
-      ? {
-          code: "finalization_failed",
-          message: "The agent finished, but its deck result could not be saved"
-        }
-      : {
-          code: "run_failed",
-          message: "The agent could not complete this request. Try again."
-        };
+      ? FINALIZATION_FAILED
+      : RUN_FAILED;
   }
 
   private handleRunSettled(lifecycle: SlideXRunLifecycleContext): void {
@@ -443,6 +478,7 @@ export class SlideXAgentRunService {
     addressKey: string;
     runId: string;
     cancelled: boolean;
+    publicError?: SlideXRunPublicError;
   }): Promise<void> {
     if (this.resetAddresses.has(input.addressKey)) {
       return;
@@ -453,10 +489,11 @@ export class SlideXAgentRunService {
       role: "assistant",
       content: input.cancelled
         ? "Run cancelled."
-        : "The agent could not complete this request. Try again.",
+        : input.publicError?.message ?? RUN_FAILED.message,
       metadata: {
         outcome: input.cancelled ? "cancelled" : "error",
-        runId: input.runId
+        runId: input.runId,
+        ...(input.publicError ? { errorCode: input.publicError.code } : {})
       }
     }));
     await this.options.sessionStore.writeSession(session);
