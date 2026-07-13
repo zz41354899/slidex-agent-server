@@ -13,6 +13,15 @@ It includes:
 - MotionDoc MCP stdio subprocess manager.
 - React chat panel served by the same Express app in production.
 
+## Maintainer start here
+
+Read [the conversational-agent architecture and operations guide](docs/conversational-agent.md)
+before changing the cross-repository flow or preparing a deployment. It records
+the product contract, ownership boundaries, identity and secret model, exact
+run path, production limitations, verification ladder, and the planned session
+list/switcher slice. Component-specific server rules remain in the nearby
+`src/server/**/README.md` files linked from that guide.
+
 ## Local Setup
 
 The checked-in `.env.example` is a runnable, zero-credential mock profile. It
