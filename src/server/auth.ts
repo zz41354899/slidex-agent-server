@@ -9,6 +9,7 @@ export type AuthUser = {
 
 export class AuthService {
   private readonly supabase?: SupabaseClient;
+  private readonly bypassUser?: AuthUser;
 
   constructor(private readonly env: Env) {
     if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
@@ -19,9 +20,24 @@ export class AuthService {
         }
       });
     }
+
+    // Dev-only auth bypass. Hard-guarded to non-production so it can never be
+    // enabled on a deployed server even if the flag leaks into that env.
+    if (env.NODE_ENV !== "production" && isTruthy(env.DEV_AUTH_BYPASS)) {
+      this.bypassUser = {
+        id: env.DEV_USER_ID || "dev-user",
+        email: env.DEV_USER_EMAIL || "dev@example.com"
+      };
+      console.warn(
+        `[auth] DEV_AUTH_BYPASS is ON — all requests authenticate as "${this.bypassUser.id}". Never use this in production.`
+      );
+    }
   }
 
   async getUserFromRequest(req: Request): Promise<AuthUser | null> {
+    if (this.bypassUser) {
+      return this.bypassUser;
+    }
     const token = getBearerToken(req);
     if (!token) {
       return null;
@@ -56,6 +72,10 @@ export class AuthService {
 
 export class AuthError extends Error {
   readonly statusCode = 401;
+}
+
+function isTruthy(value?: string): boolean {
+  return value === "1" || value?.toLowerCase() === "true";
 }
 
 function getBearerToken(req: Request): string | null {

@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  ConversationRunProtocolCodec,
+  type ConversationRunProtocolEvent
+} from "@roackb2/heddle-remote";
 
 export const ChatRoleSchema = z.enum(["user", "assistant", "system", "tool"]);
 
@@ -53,6 +57,75 @@ export const AgentStreamInputSchema = z.object({
   model: z.string().trim().min(1).max(120).optional()
 });
 
+export const StartAgentRunInputSchema = AgentStreamInputSchema.extend({
+  sourceRevision: z.string().trim().min(1).max(128)
+});
+
+export const StartAgentRunResultSchema = z.object({
+  accepted: z.literal(true),
+  runId: z.string(),
+  acceptedAt: z.string(),
+  session: SessionSchema
+});
+
+export const ActiveAgentRunSchema = z.object({
+  runId: z.string().min(1),
+  acceptedAt: z.string().min(1)
+});
+
+export const AgentSessionStateSchema = z.object({
+  session: SessionSchema,
+  activeRun: ActiveAgentRunSchema.nullable()
+});
+
+export const ResetAgentSessionResultSchema = z.object({
+  reset: z.literal(true)
+});
+
+export const AgentApiErrorCodeSchema = z.enum([
+  "auth_required",
+  "invalid_request",
+  "session_not_found",
+  "run_not_found",
+  "active_run_conflict",
+  "replay_unavailable",
+  "internal_error"
+]);
+
+export const AgentApiErrorResponseSchema = z.object({
+  error: z.object({
+    code: AgentApiErrorCodeSchema,
+    message: z.string().min(1)
+  })
+});
+
+export const PublicConversationActivitySchema = z
+  .object({
+    type: z.string(),
+    text: z.string().optional(),
+    tool: z.string().optional(),
+    result: z.object({
+      ok: z.boolean().optional()
+    }).optional()
+  })
+  .transform((activity) => activity.type === "assistant.stream"
+    ? { type: activity.type }
+    : activity);
+
+export const SlideXRunResultSchema = z.object({
+  session: SessionSchema,
+  motionDoc: z.string(),
+  assistantMessage: z.string(),
+  baseSourceRevision: z.string()
+});
+
+export const AgentRunProtocol = new ConversationRunProtocolCodec({
+  activity: PublicConversationActivitySchema,
+  result: SlideXRunResultSchema
+});
+
+export const AgentRunEventSchema = AgentRunProtocol.eventSchema;
+
 export const AgentStreamEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("session"),
@@ -93,3 +166,11 @@ export type Session = z.infer<typeof SessionSchema>;
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 export type AgentStreamInput = z.infer<typeof AgentStreamInputSchema>;
 export type AgentStreamEvent = z.infer<typeof AgentStreamEventSchema>;
+export type StartAgentRunInput = z.infer<typeof StartAgentRunInputSchema>;
+export type StartAgentRunResult = z.infer<typeof StartAgentRunResultSchema>;
+export type AgentSessionState = z.infer<typeof AgentSessionStateSchema>;
+export type AgentApiErrorCode = z.infer<typeof AgentApiErrorCodeSchema>;
+export type AgentRunEvent = ConversationRunProtocolEvent<
+  z.infer<typeof PublicConversationActivitySchema>,
+  z.infer<typeof SlideXRunResultSchema>
+>;
