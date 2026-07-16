@@ -106,6 +106,10 @@ success. `presentationSourceRevision` is the database CAS revision;
 result protection. An unchanged result skips the database write, a real CAS
 conflict becomes `presentation_conflict`, and file product mode persists an
 explicit `pending` deck-finalization status with the terminal and MotionDoc.
+If the terminal append response is lost after commit, the service reads back
+and accepts only the exact run terminal. A genuinely missing completion record
+after a saved/unchanged deck becomes `completion_record_failed`, so the client
+is told to refresh rather than retry an ambiguous mutation.
 The route layer maps the service's stable product errors to HTTP status codes
 and sanitizes unknown failures. Structured lifecycle logs contain only stable
 correlation, outcome, and safe product error-code facts; prompts, MotionDoc

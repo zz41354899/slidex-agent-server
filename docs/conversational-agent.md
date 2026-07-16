@@ -177,8 +177,10 @@ Failures use a stable JSON envelope:
 Request-level codes are `auth_required`, `invalid_request`,
 `session_not_found`, `run_not_found`, `active_run_conflict`,
 `replay_unavailable`, and `internal_error`. Model credential, quota,
-validation, Presentation conflict/finalization, and run failures are sanitized
-terminal events rather than raw provider errors.
+validation, Presentation conflict/finalization, completion-record, and run
+failures are sanitized terminal events rather than raw provider errors. An
+exact terminal whose append response was lost is recovered by run identity;
+an ambiguous post-save failure tells the client to refresh before retrying.
 
 The existing `POST /api/agent/stream` and tRPC session procedures predate the
 editor's reconnectable lifecycle. Maintain compatibility, but put new editor

@@ -273,7 +273,9 @@ model-authored assistant streams are not exposed before this terminal boundary.
 The run-start request carries both an editor-source fingerprint and the numeric
 Presentation revision. A newer manual edit produces `presentation_conflict`
 instead of being overwritten; an equivalent intervening autosave may be retried
-once at its newer revision.
+once at its newer revision. An exact terminal is recovered after a lost append
+response; a genuinely missing completion record after a saved deck is reported
+separately so clients refresh before retrying an ambiguous mutation.
 
 Heddle's `stateRoot` is created per user/session under `DATA_DIR/heddle`, so
 traces and artifacts remain on that volume. In file Heddle-storage mode, the

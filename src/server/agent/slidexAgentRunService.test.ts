@@ -135,6 +135,102 @@ test("commits a changed Presentation before publishing terminal success", async 
   }
 });
 
+test("recovers an exact terminal whose append response was lost after commit", async () => {
+  const fixture = await createFixture(
+    createEngine(),
+    undefined,
+    undefined,
+    {
+      commitAgentResult: async () => ({
+        sourceRevision: 8,
+        updatedAt: "2026-07-17T00:00:00.000Z"
+      })
+    }
+  );
+  const appendRunMessage = fixture.sessionStore.appendRunMessage.bind(fixture.sessionStore);
+  fixture.sessionStore.appendRunMessage = async (input) => {
+    const persisted = await appendRunMessage(input);
+    if (input.kind === "assistant_terminal") {
+      throw new Error("response lost after commit");
+    }
+    return persisted;
+  };
+
+  try {
+    const accepted = await fixture.start({
+      message: "Update it",
+      motionDoc: "# Original deck",
+      sourceRevision: "revision-1",
+      llmApiKey: "test-api-key"
+    });
+    const events = await collect(fixture.service.subscribe({
+      userId: fixture.user.id,
+      runId: accepted.runId
+    }));
+    const terminal = events.at(-1);
+
+    assert.ok(terminal && terminal.kind === "result");
+    assert.equal(terminal.result.presentationSourceRevision, 8);
+    assert.equal(
+      terminal.result.session.messages.filter((message) => (
+        message.metadata?.runId === accepted.runId
+        && message.metadata.kind === "assistant_terminal"
+      )).length,
+      1
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("reports a missing completion record truthfully after the deck was saved", async () => {
+  let deckCommits = 0;
+  const fixture = await createFixture(
+    createEngine(),
+    undefined,
+    undefined,
+    {
+      commitAgentResult: async () => {
+        deckCommits += 1;
+        return {
+          sourceRevision: 8,
+          updatedAt: "2026-07-17T00:00:00.000Z"
+        };
+      }
+    }
+  );
+  const appendRunMessage = fixture.sessionStore.appendRunMessage.bind(fixture.sessionStore);
+  fixture.sessionStore.appendRunMessage = async (input) => {
+    if (input.kind === "assistant_terminal") {
+      throw new Error("terminal storage unavailable");
+    }
+    return appendRunMessage(input);
+  };
+
+  try {
+    const accepted = await fixture.start({
+      message: "Update it",
+      motionDoc: "# Original deck",
+      sourceRevision: "revision-1",
+      llmApiKey: "test-api-key"
+    });
+    const events = await collect(fixture.service.subscribe({
+      userId: fixture.user.id,
+      runId: accepted.runId
+    }));
+    const terminal = events.at(-1);
+
+    assert.equal(deckCommits, 1);
+    assert.ok(terminal && terminal.kind === "error");
+    assert.deepEqual(terminal.error, {
+      code: "completion_record_failed",
+      message: "The presentation is current, but the conversation completion could not be recorded. Refresh before sending another request."
+    });
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("publishes a recoverable conflict without claiming the deck was saved", async () => {
   const fixture = await createFixture(
     createEngine(),
@@ -328,6 +424,10 @@ test("keeps runs private to the authenticated user", async () => {
       () => fixture.service.cancel("another-user", accepted.runId),
       /Agent run not found/
     );
+    await collect(fixture.service.subscribe({
+      userId: fixture.user.id,
+      runId: accepted.runId
+    }));
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
