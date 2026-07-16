@@ -47,6 +47,9 @@ dual-write, merge, or silent fallback between file and Supabase storage.
 - Message identity is `(session, user, run, lifecycle kind)`. An exact retry
   returns the existing message; a retry with changed content or metadata is a
   conflict rather than a second row.
+- Conversation deletion is owner-scoped and idempotent. The Supabase adapter
+  retries its cascade once so a transient failure or lost committed response
+  does not leave the UI in an ambiguous state; a persistent error still fails.
 - Catalog order is `updated_at DESC, id DESC`; the opaque cursor uses the same
   comparison so equal timestamps cannot skip or duplicate sessions.
 - Catalog responses omit messages, MotionDoc source, user IDs, credentials,
