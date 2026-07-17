@@ -8,7 +8,14 @@ It includes:
 - Express SSE route at `POST /api/agent/stream`.
 - Zod validation for API inputs and persisted sessions.
 - Supabase Auth token verification.
-- Local JSON session storage for Railway persistent volumes.
+- File or server-only Supabase storage for SlideX's browser-visible conversation
+  catalog and durable transcript.
+- An independent file or Supabase adapter for complete Heddle conversation
+  records.
+- A bounded, presentation-aware conversation catalog for restoring durable
+  work in the SlideX editor.
+- Server-owned expected-revision finalization of changed canonical
+  Presentations before terminal success in Supabase product mode.
 - Heddle adapter that creates a per-request engine with the user's own LLM key while reusing one durable Heddle conversation per SlideX session.
 - MotionDoc MCP stdio subprocess manager.
 - React chat panel served by the same Express app in production.
@@ -99,6 +106,8 @@ SLIDEX_AGENT_ENABLED=true
 DEFAULT_MODEL=gpt-5.4
 SUPABASE_URL=http://127.0.0.1:54321
 SUPABASE_ANON_KEY=<ANON_KEY from supabase status>
+SLIDEX_PRODUCT_SESSION_STORAGE=file
+HEDDLE_SESSION_STORAGE=file
 HEDDLE_WORKSPACE_ROOT=/absolute/path/to/SlideX
 MOTIONDOC_MCP_COMMAND=npm
 MOTIONDOC_MCP_ARGS='["run","mcp"]'
@@ -126,7 +135,9 @@ valid OpenAI API key. The expected product behavior is:
 5. An invalid key produces a stable credential-rejected message without a raw
    provider error; **Forget key** removes the tab-local key.
 6. **New conversation** clears chat continuity without deleting the current
-   editor deck.
+   editor deck or the previous conversation.
+7. The conversation catalog lists durable work, selects earlier sessions, and
+   deletes only through an explicit destructive action.
 
 For a repeatable API-level proof, export `OPENAI_API_KEY` (or
 `PERSONAL_OPENAI_API_KEY`) in the shell and run:
@@ -168,7 +179,7 @@ auth bypass. The same test, typecheck, and build run in
 `.github/workflows/agent-regression.yml`. Keep product lifecycle assertions in
 this composed test and use handler stubs only for isolated transport errors.
 
-The reconnectable run API is also default-off so deploying this branch preserves the upstream server behavior. Set `SLIDEX_AGENT_ENABLED=true` to register `/api/agent/runs`, `/api/agent/runs/:runId/events`, and `/api/agent/runs/:runId/cancel`. The SlideX editor must be built with `NEXT_PUBLIC_SLIDEX_AGENT_ENABLED=true` at the same time. Leave both flags unset or `false` to keep the conversational agent hidden; the existing `/api/agent/stream` route is unaffected.
+The reconnectable run API is also default-off so deploying this branch preserves the upstream server behavior. Set `SLIDEX_AGENT_ENABLED=true` to register `/api/agent/runs`, the bounded `/api/agent/sessions` catalog, session detail/association/deletion, `/api/agent/runs/:runId/events`, and `/api/agent/runs/:runId/cancel`. The SlideX editor must be built with `NEXT_PUBLIC_SLIDEX_AGENT_ENABLED=true` at the same time. Leave both flags unset or `false` to keep the conversational agent hidden; the existing `/api/agent/stream` route is unaffected.
 
 When that server flag is enabled in production, `CORS_ORIGIN` must be an
 explicit comma-separated allowlist such as `https://editor.example.com`; `*`
@@ -206,9 +217,42 @@ MOTIONDOC_MCP_ARGS='["/app/path/to/motiondoc-mcp.js"]'
 MOTIONDOC_MCP_CWD=/app
 ```
 
-The SlideX conversational agent is built in this repo (`src/server/agent/slidexHeddleAgent.ts`), driven by `src/server/agent/heddleDriver.ts`. The driver prepares the SlideX MCP once as a **self-contained Heddle host extension**, then builds a fresh, user-scoped conversation engine per request and delegates the turn to the agent module. The stable per-user/session `stateRoot` and deterministic internal session ID make those engines reuse one durable Heddle conversation. Heddle owns model-facing history, leases, and compaction; the server's `Session.messages` remains the user-facing chat projection and is not replayed into model prompts.
+The SlideX conversational agent is built in this repo (`src/server/agent/slidexHeddleAgent.ts`), driven by `src/server/agent/heddleDriver.ts`. The driver prepares the SlideX MCP once as a **self-contained Heddle host extension**, then builds a fresh, user-scoped conversation engine per request and delegates the turn to the agent module. The deterministic internal session ID makes those engines reuse one durable Heddle conversation. Heddle v5 owns the asynchronous, revision-safe conversation catalog plus model-facing history, leases, and compaction; the server's `Session.messages` remains the user-facing chat projection and is not replayed into model prompts.
 
-The extension uses Heddle 4.2 mirror result-artifact rules for MotionDoc-writing tools. Each updated MotionDoc is persisted and set as the current session artifact while its full `source` remains inline for the next stateless MCP edit. The agent reads a newly mirrored artifact after the turn; if no new artifact was produced, it preserves the request's authoritative MotionDoc so a read-only turn cannot restore stale deck state.
+`SLIDEX_PRODUCT_SESSION_STORAGE=file` keeps the browser-visible conversation
+catalog and transcript under `DATA_DIR/sessions`. Set it to `supabase` only
+after the `agent_sessions`, `agent_session_messages`, and `presentations`
+tables plus the `append_agent_session_message` and
+`mcp_compare_and_swap_presentation_document` RPCs are installed. The adapter
+creates the catalog parent before accepting a run, commits the user message
+before returning `202`, appends one idempotent terminal per run, scopes every
+service-role operation to the verified user, and reads the current deck from
+canonical `presentations.source`. A validated changed deck is committed through
+the service-role Presentation CAS before that success terminal is appended or
+published. Read-only turns do not increment the source revision; file product
+mode stores an explicit durable pending result for browser reconciliation.
+
+`HEDDLE_SESSION_STORAGE=file` remains the deployment default. Existing v4 file
+sessions are read in place and upgraded on their next mutation, so the Railway
+`DATA_DIR` volume must remain mounted across the package upgrade. A prepared
+`HEDDLE_SESSION_STORAGE=supabase` mode injects the server-owned
+`SupabaseChatSessionRepository` into Heddle. It requires `SUPABASE_URL` plus
+`SUPABASE_SERVICE_ROLE_KEY`, scopes every query to the verified user, and uses
+atomic expected revisions for updates and deletes. Do not enable it until the
+`agent_session_records` migration and live acceptance have passed. Selection
+is a clean cutover: the server does not dual-write or silently fall back.
+
+For completed conversation continuity across replicas, configure both
+`SLIDEX_PRODUCT_SESSION_STORAGE=supabase` and
+`HEDDLE_SESSION_STORAGE=supabase`. The first preserves what the user sees; the
+second preserves the model-facing Heddle memory. They are intentionally
+separate so neither public product history nor opaque runtime state becomes an
+accidental projection of the other. Active execution, cancellation, SSE, and
+short replay remain process-local; a disconnect may be resumed only while the
+owning process retains the run, but refresh after completion hydrates the
+durable transcript and deck.
+
+The extension uses Heddle mirror result-artifact rules for MotionDoc-writing tools. Each updated MotionDoc is persisted and set as the current session artifact while its full `source` remains inline for the next stateless MCP edit. The agent reads a newly mirrored artifact after the turn; if no new artifact was produced, it preserves the request's authoritative MotionDoc so a read-only turn cannot restore stale deck state.
 
 Heddle owns the MCP subprocess lifecycle via the extension (spawned per tool call), so `MOTIONDOC_MCP_*` is just the command Heddle runs — the built-in `StdioMcpProcessManager` is not used on the Heddle path.
 
@@ -226,8 +270,18 @@ Successful chat terminals use a SlideX-owned result projection. Changed decks
 must include a passing validation result for the exact final MotionDoc, and the
 visible assistant message is source-free and capped at 240 characters. Raw
 model-authored assistant streams are not exposed before this terminal boundary.
+The run-start request carries both an editor-source fingerprint and the numeric
+Presentation revision. A newer manual edit produces `presentation_conflict`
+instead of being overwritten; an equivalent intervening autosave may be retried
+once at its newer revision. An exact terminal is recovered after a lost append
+response; a genuinely missing completion record after a saved deck is reported
+separately so clients refresh before retrying an ambiguous mutation.
 
-Heddle's `stateRoot` is created per user/session under `DATA_DIR/heddle`, so its local state also lands on the Railway volume.
+Heddle's `stateRoot` is created per user/session under `DATA_DIR/heddle`, so
+traces and artifacts remain on that volume. In file Heddle-storage mode, the
+runtime conversation catalog and bodies do too; Supabase Heddle mode replaces
+only that repository. SlideX product-conversation storage is selected
+independently with `SLIDEX_PRODUCT_SESSION_STORAGE`.
 
 ## Observability
 
@@ -262,6 +316,9 @@ NODE_ENV=production
 AGENT_DRIVER=heddle
 SUPABASE_URL=...
 SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+SLIDEX_PRODUCT_SESSION_STORAGE=supabase
+HEDDLE_SESSION_STORAGE=supabase
 VITE_SUPABASE_URL=...
 VITE_SUPABASE_ANON_KEY=...
 DEFAULT_MODEL=gpt-4.1
@@ -314,8 +371,12 @@ Events are emitted as normal SSE frames with `event:` and JSON `data:` fields: `
 When `SLIDEX_AGENT_ENABLED=true`, the reconnectable run API used by the SlideX editor is:
 
 - `POST /api/agent/runs` to accept a run and return its `runId`.
+- `GET /api/agent/sessions?limit=<1..50>&cursor=<opaque>` to list a bounded,
+  newest-first catalog without returning chat or MotionDoc source.
 - `GET /api/agent/sessions/:sessionId` to restore durable product history and
   discover the active Heddle run for that authenticated conversation.
+- `PUT /api/agent/sessions/:sessionId/presentation` to immutably associate a
+  legacy conversation with one canonical Presentation ID or refresh its title.
 - `DELETE /api/agent/sessions/:sessionId` to cancel any active run and reset the
   product conversation without changing the editor's current deck.
 - `GET /api/agent/runs/:runId/events`, using either `?after=<sequence>` or

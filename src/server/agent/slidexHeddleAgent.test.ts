@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HeddleEventType } from "@roackb2/heddle";
+import {
+  ChatSessionAlreadyExistsError,
+  HeddleEventType
+} from "@roackb2/heddle";
 import type {
   ConversationActivity,
   ConversationTurnResultSummary
 } from "@roackb2/heddle";
 import type { AgentProgressEvent } from "./types.js";
 import {
+  resolveConversationSession,
   runSlideXAgent,
   type ConversationEngineLike
 } from "./slidexHeddleAgent.js";
@@ -23,8 +27,13 @@ test("declares mirror capture for every MotionDoc-writing tool", () => {
       "slidex_replace_slide",
       "slidex_update_slide_props",
       "slidex_add_block",
+      "slidex_update_block",
+      "slidex_delete_block",
+      "slidex_duplicate_block",
+      "slidex_reorder_block",
       "slidex_delete_slide",
       "slidex_reorder_slide",
+      "slidex_apply_shader_preset",
       "slidex_create_slide_from_layout",
       "slidex_add_slide_from_layout",
       "slidex_replace_slide_with_layout"
@@ -141,14 +150,27 @@ test("reuses one Heddle session and submits only the current request", async () 
     emit: () => undefined
   });
 
-  assert.deepEqual(harness.createdSessionIds, ["slidex-slidex-session"]);
+  assert.deepEqual(harness.createdSessionIds, ["slidex-session"]);
   assert.deepEqual(harness.updatedModels, ["gpt-4.1"]);
   assert.deepEqual(
     harness.submissions.map((submission) => submission.sessionId),
-    ["slidex-slidex-session", "slidex-slidex-session"]
+    ["slidex-session", "slidex-session"]
   );
   assert.equal(countOccurrences(harness.submissions[1]?.prompt ?? "", "Add a conclusion in the same tone"), 1);
   assert.doesNotMatch(harness.submissions[1]?.prompt ?? "", /Conversation so far:/);
+});
+
+test("reuses a session created concurrently during first-turn resolution", async () => {
+  const harness = createEngineHarness({ concurrentCreateModel: "gpt-4.1" });
+
+  const session = await resolveConversationSession(
+    harness.engine,
+    "slidex-session",
+    "gpt-5.4"
+  );
+
+  assert.equal(session.id, "slidex-session");
+  assert.deepEqual(harness.updatedModels, ["gpt-5.4"]);
 });
 
 test("does not replace newer product state with a previous turn artifact", async () => {
@@ -191,6 +213,7 @@ function createEngineHarness(options: {
   unreadableArtifact?: boolean;
   assistantStreamText?: string;
   turnResult?: ConversationTurnResultSummary;
+  concurrentCreateModel?: string;
 } = {}): {
   engine: ConversationEngineLike;
   createdSessionIds: string[];
@@ -209,15 +232,19 @@ function createEngineHarness(options: {
     submissions,
     engine: {
       sessions: {
-        readExisting: (id) => sessions.get(id),
-        create: (input) => {
+        readExisting: async (id) => sessions.get(id),
+        create: async (input) => {
           const id = input.id ?? HEDDLE_SESSION_ID;
+          if (options.concurrentCreateModel) {
+            sessions.set(id, { id, model: options.concurrentCreateModel });
+            throw new ChatSessionAlreadyExistsError(id);
+          }
           const session = { id, model: input.model };
           sessions.set(id, session);
           createdSessionIds.push(id);
           return session;
         },
-        updateSettings: (id, input) => {
+        updateSettings: async (id, input) => {
           const session = sessions.get(id);
           if (!session) {
             throw new Error(`Missing test session ${id}`);

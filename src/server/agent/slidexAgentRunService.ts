@@ -1,8 +1,10 @@
+import { isDeepStrictEqual } from "node:util";
 import type {
   ConversationEngine,
   ModelRunFailureCode,
   SubmitConversationTurnResult
 } from "@roackb2/heddle";
+import { Mutex } from "async-mutex";
 import {
   ConversationRunConflictError,
   ConversationRunReplayUnavailableError,
@@ -14,14 +16,24 @@ import type {
   AgentApiErrorCode,
   AgentRunEvent,
   AgentSessionState,
+  AttachAgentSessionInput,
   Session,
   StartAgentRunInput
 } from "../../shared/schema.js";
 import type { AuthUser } from "../auth.js";
 import type { Env } from "../env.js";
-import { makeMessage, type SessionStore } from "../storage/sessionStore.js";
+import {
+  AgentSessionPresentationConflictError,
+  type AppendAgentSessionMessageInput,
+  type AgentSessionRepository
+} from "../storage/agentSessionRepository.js";
+import {
+  PresentationDocumentConflictError,
+  type PresentationDocumentRepository
+} from "../storage/presentationDocumentRepository.js";
 import { createSlideXConversationEngine } from "./heddleDriver.js";
 import { createMockConversationEngine } from "./mockConversationEngine.js";
+import { createChatSessionRepositoryResolver } from "./supabaseChatSessionRepository.js";
 import {
   buildPrompt,
   createSlideXApprovalHost,
@@ -35,12 +47,22 @@ type SlideXRunAddress = {
   sessionId: string;
 };
 
+type PresentationBindingLock = {
+  consumers: number;
+  mutex: Mutex;
+};
+
 type SlideXRunResult = {
   session: Session;
   motionDoc: string;
   assistantMessage: string;
   baseSourceRevision: string;
+  presentationSourceRevision?: number;
 };
+
+type DeckFinalization =
+  | { status: "saved" | "unchanged"; sourceRevision: number }
+  | { status: "pending" };
 
 type SlideXRunLifecycleContext = {
   acceptedSession?: Promise<Session>;
@@ -52,13 +74,17 @@ type SlideXRunLifecycleContext = {
   message: string;
   model: string;
   previousArtifactId?: string;
+  presentationId: string;
+  presentationSourceRevision: number;
   session: Session;
   sourceRevision: string;
   startedAt: number;
 };
 
 class SlideXAgentSessionResetError extends Error {}
+class SlideXAgentPresentationConflictError extends Error {}
 class SlideXAgentResultFinalizationError extends Error {}
+class SlideXAgentCompletionRecordError extends Error {}
 class SlideXAgentModelCredentialError extends Error {}
 class SlideXAgentModelQuotaError extends Error {}
 
@@ -109,12 +135,24 @@ const FINALIZATION_FAILED = {
   message: "The agent finished, but its deck result could not be saved"
 } as const;
 
+const COMPLETION_RECORD_FAILED = {
+  code: "completion_record_failed",
+  message: "The presentation is current, but the conversation completion could not be recorded. Refresh before sending another request."
+} as const;
+
+const PRESENTATION_CONFLICT = {
+  code: "presentation_conflict",
+  message: "The presentation changed while the agent was working. Review the current deck and try again."
+} as const;
+
 type SlideXRunPublicError =
   | typeof MODEL_CREDENTIAL_REJECTED
   | typeof MODEL_QUOTA_EXHAUSTED
   | typeof DECK_VALIDATION_FAILED
   | typeof RUN_FAILED
-  | typeof FINALIZATION_FAILED;
+  | typeof FINALIZATION_FAILED
+  | typeof COMPLETION_RECORD_FAILED
+  | typeof PRESENTATION_CONFLICT;
 
 const MODEL_FAILURE_ERROR_BY_CODE = new Map<
   ModelRunFailureCode,
@@ -126,7 +164,8 @@ const MODEL_FAILURE_ERROR_BY_CODE = new Map<
 
 export type SlideXAgentRunServiceOptions = {
   env: Env;
-  sessionStore: SessionStore;
+  agentSessionRepository: AgentSessionRepository;
+  presentationDocumentRepository?: PresentationDocumentRepository;
   createEngine?: CreateEngine;
   logger?: AgentRunLogger;
 };
@@ -154,15 +193,30 @@ export class SlideXAgentRunService {
     replay: { maxEventsPerRun: 512, retentionMs: 5 * 60_000 }
   });
   private readonly resetAddresses = new Set<string>();
+  private readonly presentationBindingLocks = new Map<
+    string,
+    PresentationBindingLock
+  >();
   private readonly createEngine: CreateEngine;
   private readonly logger: AgentRunLogger;
 
   constructor(private readonly options: SlideXAgentRunServiceOptions) {
     this.logger = options.logger ?? NOOP_LOGGER;
-    this.createEngine = options.createEngine
-      ?? (options.env.AGENT_DRIVER === "mock"
-        ? createMockConversationEngine
-        : createSlideXConversationEngine);
+    if (options.createEngine) {
+      this.createEngine = options.createEngine;
+      return;
+    }
+    if (options.env.AGENT_DRIVER === "mock") {
+      this.createEngine = createMockConversationEngine;
+      return;
+    }
+
+    const resolveSessionRepository = createChatSessionRepositoryResolver(options.env);
+    this.createEngine = (env, input) => createSlideXConversationEngine(
+      env,
+      input,
+      { sessionRepository: resolveSessionRepository(input.user.id) }
+    );
   }
 
   async start(
@@ -191,7 +245,11 @@ export class SlideXAgentRunService {
       motionDoc: input.motionDoc,
       message: input.message
     });
-    const conversation = resolveConversationSession(engine, session.id, model);
+    const conversation = await resolveConversationSession(
+      engine,
+      session.id,
+      model
+    );
     const previousArtifactId = engine.artifacts.current(conversation.id)?.id;
 
     const lifecycle: SlideXRunLifecycleContext = {
@@ -203,6 +261,8 @@ export class SlideXAgentRunService {
       message: input.message,
       model,
       previousArtifactId,
+      presentationId: input.presentationId,
+      presentationSourceRevision: input.presentationSourceRevision,
       session,
       sourceRevision: input.sourceRevision,
       startedAt
@@ -282,6 +342,39 @@ export class SlideXAgentRunService {
     };
   }
 
+  /**
+   * Immutably associates legacy product sessions with their canonical
+   * presentation. Repeated calls may refresh the display title, but a session
+   * can never be rebound to another presentation.
+   */
+  async attachSessionToPresentation(
+    userId: string,
+    sessionId: string,
+    input: AttachAgentSessionInput
+  ): Promise<Session> {
+    return this.withPresentationBindingLock({ userId, sessionId }, async () => {
+      try {
+        const session = await this.options.agentSessionRepository.attachSessionToPresentation(
+          userId,
+          sessionId,
+          input
+        );
+        if (!session) {
+          throw new SlideXAgentRunServiceError("session_not_found", "Conversation not found");
+        }
+        return session;
+      } catch (error) {
+        if (error instanceof AgentSessionPresentationConflictError) {
+          throw new SlideXAgentRunServiceError(
+            "invalid_request",
+            "Conversation belongs to a different presentation"
+          );
+        }
+        throw error;
+      }
+    });
+  }
+
   async resetSession(userId: string, sessionId: string): Promise<{ reset: true }> {
     await this.requireProductSession(userId, sessionId);
     const address = { userId, sessionId };
@@ -297,7 +390,7 @@ export class SlideXAgentRunService {
     }
 
     try {
-      await this.options.sessionStore.deleteSession(userId, sessionId);
+      await this.options.agentSessionRepository.deleteSession(userId, sessionId);
       this.logger.info({
         event: "agent_session.reset",
         sessionId,
@@ -329,35 +422,46 @@ export class SlideXAgentRunService {
 
   private async resolveProductSession(userId: string, input: StartAgentRunInput): Promise<Session> {
     if (input.sessionId) {
-      return this.requireProductSession(userId, input.sessionId);
+      return this.attachSessionToPresentation(userId, input.sessionId, {
+        presentationId: input.presentationId,
+        presentationTitle: input.presentationTitle
+      });
     }
-    return this.options.sessionStore.createSession({
+    return this.options.agentSessionRepository.createSession({
       userId,
-      title: input.title ?? titleFromMessage(input.message),
-      motionDoc: input.motionDoc
+      title: titleFromMessage(input.message),
+      motionDoc: input.motionDoc,
+      presentationId: input.presentationId,
+      presentationTitle: input.presentationTitle
     });
   }
 
   private async requireProductSession(userId: string, sessionId: string): Promise<Session> {
-    const session = await this.options.sessionStore.getSession(userId, sessionId);
+    const session = await this.options.agentSessionRepository.getSession(userId, sessionId);
     if (!session) {
       throw new SlideXAgentRunServiceError("session_not_found", "Conversation not found");
     }
     return session;
   }
 
-  private persistAcceptedMessage(
+  private async persistAcceptedMessage(
     session: Session,
     input: { message: string; motionDoc: string },
     runId: string
   ): Promise<Session> {
-    session.latestMotionDoc = input.motionDoc;
-    session.messages.push(makeMessage({
+    const persisted = await this.options.agentSessionRepository.appendRunMessage({
+      userId: session.userId,
+      sessionId: session.id,
+      runId,
+      kind: "user_input",
       role: "user",
       content: input.message,
-      metadata: { runId }
-    }));
-    return this.options.sessionStore.writeSession(session);
+      latestMotionDoc: input.motionDoc
+    });
+    if (!persisted) {
+      throw new SlideXAgentRunServiceError("session_not_found", "Conversation not found");
+    }
+    return persisted;
   }
 
   private handleRunAccepted(
@@ -401,50 +505,71 @@ export class SlideXAgentRunService {
       throw new Error("Agent run returned an error outcome");
     }
 
+    let currentSession: Session;
+    let motionDoc: string;
+    let assistantMessage: string;
+    let finalization: DeckFinalization;
     try {
-      const currentSession = await this.requireAcceptedSession(lifecycle);
-      const { motionDoc, assistantMessage } = projectSlideXTurnResult({
+      currentSession = await this.requireAcceptedSession(lifecycle);
+      ({ motionDoc, assistantMessage } = projectSlideXTurnResult({
         engine: lifecycle.engine,
         sessionId: lifecycle.conversationId,
         previousArtifactId: lifecycle.previousArtifactId,
         initialMotionDoc: lifecycle.initialMotionDoc,
         result: turnResult
-      });
-      currentSession.latestMotionDoc = motionDoc;
-      currentSession.messages.push(
-        makeMessage({
-          role: "assistant",
-          content: assistantMessage,
-          metadata: {
-            outcome: turnResult.outcome,
-            runId: runContext.runId,
-            toolCalls: turnResult.toolResults.length
-          }
-        })
-      );
-      const persistedSession = await this.options.sessionStore.writeSession(currentSession);
-      this.logger.info({
-        event: "agent_run.terminal",
-        runId: runContext.runId,
-        sessionId: lifecycle.session.id,
-        model: lifecycle.model,
-        outcome: turnResult.outcome,
-        durationMs: Date.now() - lifecycle.startedAt,
-        toolCallCount: turnResult.toolResults.length,
-        ...lifecycle.correlation
-      }, "Agent run completed");
-      return {
-        session: persistedSession,
-        motionDoc,
-        assistantMessage,
-        baseSourceRevision: lifecycle.sourceRevision
-      };
+      }));
+      finalization = await this.finalizeDeck(lifecycle, motionDoc);
     } catch (error) {
-      if (error instanceof SlideXDeckValidationError) {
+      if (error instanceof SlideXDeckValidationError
+        || error instanceof SlideXAgentPresentationConflictError) {
         throw error;
       }
       throw new SlideXAgentResultFinalizationError();
     }
+
+    const persistedSession = await this.persistSuccessfulTerminal(
+      {
+        userId: currentSession.userId,
+        sessionId: currentSession.id,
+        runId: runContext.runId,
+        kind: "assistant_terminal",
+        role: "assistant",
+        content: assistantMessage,
+        metadata: {
+          outcome: turnResult.outcome,
+          toolCalls: turnResult.toolResults.length,
+          deckFinalization: finalization.status,
+          ...(finalization.status === "pending"
+            ? {}
+            : { presentationSourceRevision: finalization.sourceRevision })
+        },
+        latestMotionDoc: motionDoc
+      },
+      finalization
+    );
+    this.logger.info({
+      event: "agent_run.terminal",
+      runId: runContext.runId,
+      sessionId: lifecycle.session.id,
+      model: lifecycle.model,
+      outcome: turnResult.outcome,
+      durationMs: Date.now() - lifecycle.startedAt,
+      toolCallCount: turnResult.toolResults.length,
+      deckFinalization: finalization.status,
+      ...(finalization.status === "pending"
+        ? {}
+        : { presentationSourceRevision: finalization.sourceRevision }),
+      ...lifecycle.correlation
+    }, "Agent run completed");
+    return {
+      session: persistedSession,
+      motionDoc,
+      assistantMessage,
+      baseSourceRevision: lifecycle.sourceRevision,
+      ...(finalization.status === "pending"
+        ? {}
+        : { presentationSourceRevision: finalization.sourceRevision })
+    };
   }
 
   private async handleRunError(
@@ -475,6 +600,10 @@ export class SlideXAgentRunService {
       this.logger.info(fields, "Agent run cancelled");
     } else if (error instanceof SlideXAgentResultFinalizationError) {
       this.logger.warn(fields, "Agent run result finalization failed");
+    } else if (error instanceof SlideXAgentCompletionRecordError) {
+      this.logger.warn(fields, "Agent run completion record finalization failed");
+    } else if (error instanceof SlideXAgentPresentationConflictError) {
+      this.logger.warn(fields, "Agent run result conflicted with a newer presentation");
     } else {
       this.logger.warn(fields, "Agent run failed");
     }
@@ -490,6 +619,12 @@ export class SlideXAgentRunService {
     if (error instanceof SlideXDeckValidationError) {
       return DECK_VALIDATION_FAILED;
     }
+    if (error instanceof SlideXAgentPresentationConflictError) {
+      return PRESENTATION_CONFLICT;
+    }
+    if (error instanceof SlideXAgentCompletionRecordError) {
+      return COMPLETION_RECORD_FAILED;
+    }
     return error instanceof SlideXAgentResultFinalizationError
       ? FINALIZATION_FAILED
       : RUN_FAILED;
@@ -497,6 +632,87 @@ export class SlideXAgentRunService {
 
   private handleRunSettled(lifecycle: SlideXRunLifecycleContext): void {
     this.resetAddresses.delete(lifecycle.addressKey);
+  }
+
+  private async finalizeDeck(
+    lifecycle: SlideXRunLifecycleContext,
+    motionDoc: string
+  ): Promise<DeckFinalization> {
+    if (motionDoc === lifecycle.initialMotionDoc) {
+      return {
+        status: "unchanged",
+        sourceRevision: lifecycle.presentationSourceRevision
+      };
+    }
+    const repository = this.options.presentationDocumentRepository;
+    if (!repository) {
+      return { status: "pending" };
+    }
+
+    try {
+      const saved = await repository.commitAgentResult({
+        userId: lifecycle.session.userId,
+        presentationId: lifecycle.presentationId,
+        expectedSourceRevision: lifecycle.presentationSourceRevision,
+        baseSource: lifecycle.initialMotionDoc,
+        nextSource: motionDoc
+      });
+      return { status: "saved", sourceRevision: saved.sourceRevision };
+    } catch (error) {
+      if (error instanceof PresentationDocumentConflictError) {
+        throw new SlideXAgentPresentationConflictError();
+      }
+      throw error;
+    }
+  }
+
+  private async persistSuccessfulTerminal(
+    input: AppendAgentSessionMessageInput,
+    finalization: DeckFinalization
+  ): Promise<Session> {
+    try {
+      const persisted = await this.options.agentSessionRepository.appendRunMessage(input);
+      if (persisted) {
+        return persisted;
+      }
+    } catch {
+      const recovered = await this.recoverCommittedMessage(input);
+      if (recovered) {
+        return recovered;
+      }
+    }
+
+    if (finalization.status === "pending") {
+      throw new SlideXAgentResultFinalizationError();
+    }
+    throw new SlideXAgentCompletionRecordError();
+  }
+
+  private async recoverCommittedMessage(
+    input: AppendAgentSessionMessageInput
+  ): Promise<Session | null> {
+    try {
+      const session = await this.options.agentSessionRepository.getSession(
+        input.userId,
+        input.sessionId
+      );
+      if (!session) {
+        return null;
+      }
+      const expectedMetadata = {
+        ...(input.metadata ?? {}),
+        runId: input.runId,
+        kind: input.kind
+      };
+      const committed = session.messages.some((message) => (
+        message.role === input.role
+        && message.content === input.content
+        && isDeepStrictEqual(message.metadata, expectedMetadata)
+      ));
+      return committed ? session : null;
+    } catch {
+      return null;
+    }
   }
 
   private requireAcceptedSession(
@@ -520,18 +736,23 @@ export class SlideXAgentRunService {
     }
 
     const session = await input.acceptedSession;
-    session.messages.push(makeMessage({
+    const persisted = await this.options.agentSessionRepository.appendRunMessage({
+      userId: session.userId,
+      sessionId: session.id,
+      runId: input.runId,
+      kind: "assistant_terminal",
       role: "assistant",
       content: input.cancelled
         ? "Run cancelled."
         : input.publicError?.message ?? RUN_FAILED.message,
       metadata: {
         outcome: input.cancelled ? "cancelled" : "error",
-        runId: input.runId,
         ...(input.publicError ? { errorCode: input.publicError.code } : {})
       }
-    }));
-    await this.options.sessionStore.writeSession(session);
+    });
+    if (!persisted) {
+      throw new SlideXAgentResultFinalizationError();
+    }
   }
 
   private requireOwnedRun(
@@ -543,6 +764,33 @@ export class SlideXAgentRunService {
       throw new SlideXAgentRunServiceError("run_not_found", "Agent run not found");
     }
     return run;
+  }
+
+  /**
+   * Serializes the read-check-write binding transaction for one product
+   * session. Reference counting prevents inactive session keys from
+   * accumulating for the lifetime of the process.
+   */
+  private async withPresentationBindingLock<T>(
+    address: SlideXRunAddress,
+    action: () => Promise<T>
+  ): Promise<T> {
+    const key = addressKey(address);
+    const lock = this.presentationBindingLocks.get(key) ?? {
+      consumers: 0,
+      mutex: new Mutex()
+    };
+    lock.consumers += 1;
+    this.presentationBindingLocks.set(key, lock);
+
+    try {
+      return await lock.mutex.runExclusive(action);
+    } finally {
+      lock.consumers -= 1;
+      if (lock.consumers === 0) {
+        this.presentationBindingLocks.delete(key);
+      }
+    }
   }
 }
 

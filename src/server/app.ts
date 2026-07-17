@@ -8,8 +8,10 @@ import { createContextFactory, type ServerDeps } from "./context.js";
 import { createAgentStreamHandler, type AgentStreamDeps } from "./routes/agentStream.js";
 import { SlideXAgentRunService } from "./agent/slidexAgentRunService.js";
 import {
+  createAttachAgentSessionHandler,
   createCancelAgentRunHandler,
   createGetAgentSessionHandler,
+  createListAgentSessionsHandler,
   createResetAgentSessionHandler,
   createStartAgentRunHandler,
   createSubscribeAgentRunHandler
@@ -20,6 +22,7 @@ import { createCorsOriginPolicy } from "./http/corsPolicy.js";
 export function createApp(deps: ServerDeps & Pick<AgentStreamDeps, "mcpManager">) {
   const app = express();
   const logger = deps.logger ?? createServerLogger(deps.env);
+  const agentSessionRepository = deps.agentSessionRepository ?? deps.sessionStore;
 
   app.disable("x-powered-by");
   app.use(createHttpLogger(logger));
@@ -39,6 +42,10 @@ export function createApp(deps: ServerDeps & Pick<AgentStreamDeps, "mcpManager">
       ok: true,
       agentDriver: deps.env.AGENT_DRIVER,
       dataDir: deps.env.dataDir,
+      productSessionStorage: deps.env.SLIDEX_PRODUCT_SESSION_STORAGE,
+      presentationFinalization: deps.presentationDocumentRepository
+        ? "supabase"
+        : "pending",
       mcpConfigured: deps.mcpManager.configured
     });
   });
@@ -55,7 +62,8 @@ export function createApp(deps: ServerDeps & Pick<AgentStreamDeps, "mcpManager">
   if (deps.env.SLIDEX_AGENT_ENABLED) {
     const agentRunService = new SlideXAgentRunService({
       env: deps.env,
-      sessionStore: deps.sessionStore,
+      agentSessionRepository,
+      presentationDocumentRepository: deps.presentationDocumentRepository,
       logger: logger.child({ component: "agent-run-service" })
     });
     const agentRunRouteDeps = {
@@ -64,7 +72,15 @@ export function createApp(deps: ServerDeps & Pick<AgentStreamDeps, "mcpManager">
     };
 
     app.post("/api/agent/runs", createStartAgentRunHandler(agentRunRouteDeps));
+    app.get("/api/agent/sessions", createListAgentSessionsHandler({
+      authService: deps.authService,
+      agentSessionRepository
+    }));
     app.get("/api/agent/sessions/:sessionId", createGetAgentSessionHandler(agentRunRouteDeps));
+    app.put(
+      "/api/agent/sessions/:sessionId/presentation",
+      createAttachAgentSessionHandler(agentRunRouteDeps)
+    );
     app.delete("/api/agent/sessions/:sessionId", createResetAgentSessionHandler(agentRunRouteDeps));
     app.get("/api/agent/runs/:runId/events", createSubscribeAgentRunHandler(agentRunRouteDeps));
     app.post("/api/agent/runs/:runId/cancel", createCancelAgentRunHandler(agentRunRouteDeps));
